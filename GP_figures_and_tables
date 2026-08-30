@@ -1,0 +1,569 @@
+#############################################################
+library(CMplot)
+library(GGally)
+library(RColorBrewer)
+library(corrplot)
+library(cowplot)
+library(dendextend)
+library(dplyr)
+library(forcats)
+library(ggplot2)
+library(ggpubr)
+library(grid)
+library(gridExtra)
+library(mgcv)
+library(png)
+library(stringr)
+library(tibble)
+library(tidygam)
+library(tidymv)
+library(tidyr)
+library(viridis)
+library(writexl)
+#############################################################
+#A) Paths 
+#############################################################
+ 
+submission          = "submission2"
+wanted_version      = "02_07_2025"
+
+path                = "/home/tasha/breedfuture/"
+
+#Inputs 
+path_map            = paste0(path, "raw_data/WW/geno/plink/all_data/")
+
+path_geno           = paste0(path, "prepared_data/", submission, "/genotypes/")  
+
+path_pheno          = paste0(path, "prepared_data/", submission, "/phenotypes/")  
+
+spatial_models      = paste0(path_pheno, "models/approach1/")
+
+
+#Outputs
+path_models         = paste0(path, "output/", submission, "/")
+
+path_figures        = paste0(path, "results/", submission, "/figures/")
+
+path_tables         = paste0(path, "results/", submission, "/tables/")
+
+#############################################################
+#B) Parameters
+#############################################################
+              
+quantiles          = c(paste0(seq(30, 90, by = 20), "%"), "95%", "99%")
+
+viridis_colors     = viridis(10)
+spectral_colors    = brewer.pal(9, "Spectral")
+               
+colors_in_use      = c("Negative selection"  = viridis(2, option = "D")[1],
+                       "Positive selection"  = viridis(2, option = "D")[2])
+
+#############################################################
+#C) Model output
+#############################################################
+
+#Kernel scaling factors
+kernel_info        = readRDS(paste0(path, "prepared_data/", submission, "/kinships/kernel_info_list.rds"))
+
+#Phenotypes
+data_list          = readRDS(paste0(path_pheno, "prepared_data_list.rds"))
+data_GP            = data_list[["GP"]]
+data_GWAS          = data_list[["GWAS"]]
+
+#Mean partition
+mean_partition_mar = local({x <- readRDS(paste0(path_models, "mean_partition_marginal_unpermuted.rds"))
+                     rbind( x,   readRDS(paste0(path_models, "mean_partition_marginal_permuted.rds"))[, 
+                     colnames(x), drop = FALSE])})    
+                     
+mean_partition_con = local({x <- readRDS(paste0(path_models, "mean_partition_conditional_unpermuted.rds"))
+                     rbind( x,   readRDS(paste0(path_models, "mean_partition_conditional_permuted.rds"))[, 
+                     colnames(x), drop = FALSE])}) 
+                     
+#Variance partition
+###Single kernel (SK)
+ll_SK_unpermuted   = readRDS(paste0(path_models, "SK_likelihoods_unpermuted.rds")) %>% 
+                     dplyr::select(c("trait", "llik")) %>% dplyr::rename("M1" = "llik")
+
+###Multi kernel (MK)
+ll_MK_unpermuted   = readRDS(paste0(path_models, "MK_likelihoods_unpermuted.rds")) %>% dplyr::select(-c("iter"))                        
+ll_MK_permuted     = readRDS(paste0(path_models, "MK_likelihoods_permuted.rds"))
+likelihoods_MK     = rbind(ll_MK_unpermuted, ll_MK_permuted)
+
+##Variance components
+variance_SK        = readRDS(paste0(path_models, "SK_variance_components_unpermuted.rds"))
+variance_MK        = readRDS(paste0(path_models, "MK_variance_components_unpermuted.rds")) 
+variance           = rbind(variance_SK, variance_MK)
+
+#Reliability (sommer)
+reliability_df     = readRDS(paste0(path_models, "SK_reliability_unpermuted.rds"))
+
+#Validation       
+validation_qgg     = readRDS(paste0(path_models, "validation_genetic_cluster_unpermuted.rds")) #qgg
+
+validation_MM4LMM  = readRDS(paste0(path_models, "validation_genetic_cluster_unpermuted_MM4LMM.rds"))
+
+#############################################################
+#D) Functions 
+#############################################################
+
+#Function 1
+rename_traits      = function(df) {
+
+df %>% dplyr::mutate(trait = recode(trait, "Protein" = "GPD", "Plantheight" = "Plant height")) }
+
+#Function 2 (Mean partition)
+get_empirical_p    = function(df) {
+  
+                      df %>%
+                      group_by(trait, quantile, covariate) %>%
+                      summarise(obs_zscore = z[permute == "no"][1],
+                                r          = {permuted_yes <- z[permute == "yes"]
+                      if (obs_zscore > 0) { sum(permuted_yes >= obs_zscore)
+              
+               } else if (obs_zscore < 0) { sum(permuted_yes <= obs_zscore)
+            
+               } else { 0 }},
+              
+               n = sum(permute == "yes"),
+               p_empirical = (r + 1) / (n + 1), .groups = "drop") %>% ungroup() %>%
+               dplyr::select(trait, quantile, covariate, p_empirical) }
+               
+#Function 3 (Variance partition)
+get_empirical_LLR = function(df) {
+  
+                    df %>%
+                    dplyr::group_by(trait, quantile, comparison) %>%
+                    dplyr::summarise(obs_LLR = LLR[permuted == "no"][1], permuted_yes = list(LLR[permuted == "yes"]),
+                                     n = sum(permuted == "yes"), r = sum(unlist(permuted_yes) >= obs_LLR), p_empirical = (r + 1) / (n + 1),
+                    .groups = "drop") %>% dplyr::select(trait, quantile, comparison, p_empirical) }
+
+#############################################################
+#E) Mean partition (prepare input)
+#############################################################
+
+#Marginal analysis
+mean_part_mar_final = mean_partition_mar %>%
+                      dplyr::mutate(B_z = B / B_SE, D_z = D / D_SE) %>%
+                      dplyr::rename(B_effect = B, D_effect = D) %>%
+                      pivot_longer(cols = c(B_effect, D_effect, B_SE, D_SE, B_z, D_z, B_sig, D_sig), 
+                      names_to = c("covariate", ".value"), names_pattern = "(B|D)_(.*)") %>%                                 
+                      left_join(get_empirical_p(.), by = c("trait", "quantile", "covariate")) %>%
+                      dplyr::filter(permute == "no") %>% 
+                      dplyr::mutate(analysis  = "Marginal",
+                                    covariate = recode(covariate, B = "Positive selection (marginal)", 
+                                                                  D = "Negative selection (marginal)"))
+                                     
+#Conditional analysis                                     
+mean_part_con_final = mean_partition_con %>%
+                      dplyr::mutate(B_z = B / B_SE, D_z = D / D_SE, BxE_z = BxE / BxE_SE, DxE_z = DxE / DxE_SE) %>%
+                      dplyr::rename(B_effect = B, D_effect = D, BxE_effect = BxE, DxE_effect = DxE) %>%
+                      pivot_longer(cols = c(B_effect, D_effect, BxE_effect, DxE_effect, B_SE, D_SE, BxE_SE, DxE_SE, 
+                                            B_z, D_z, BxE_z, DxE_z, B_sig, D_sig, BxE_sig, DxE_sig),
+                                    names_to = c("covariate", ".value"), names_pattern = "([A-Za-z]+)_(.*)") %>%
+                      left_join(get_empirical_p(.), by = c("trait", "quantile", "covariate")) %>%
+                      dplyr::filter(permute == "no") %>% 
+                      dplyr::mutate(analysis  = "Conditional",
+                                    covariate = recode(covariate, B   = "Positive selection (main)", 
+                                                                  D   = "Negative selection (main)",
+                                                                  BxE = "Positive selection (interaction)", 
+                                                                  DxE = "Negative selection (interaction)")) 
+ 
+#Combined dataframe                                                                 
+mean_part_final     = rbind(mean_part_mar_final, mean_part_con_final) %>% 
+                      dplyr::select(-c("permute", "permutation")) %>%
+                      dplyr::mutate(across(where(is.numeric), ~ round(.x, 4))) %>% dplyr::rename(p_analytical = sig) %>%
+                      select(c("analysis", "trait", "quantile", "Joint_sig", "covariate", "effect", "SE", "z", "p_analytical", "p_empirical")) %>%
+                      dplyr::mutate(category = str_extract(covariate, "\\((.*?)\\)") %>% str_remove_all("[()]") %>%  str_to_title() %>% 
+                                   factor(levels = c("Marginal", "Main", "Interaction")),
+                                   selection = str_extract(covariate, "^[^(]+") %>% str_trim()) %>% rename_traits() 
+
+mean_mar_part_final  = mean_part_final %>% 
+                       dplyr::filter(category == "Marginal") %>% 
+                       dplyr::mutate(analysis = "Marginal", category = "Effect across DK and DE") 
+                       
+mean_con_part_final  = mean_part_final %>% filter(category != "Marginal") %>%
+                       dplyr::mutate(category = recode(category, "Main" = "Effect DK", "Interaction" = "Effect Diff. DE"),
+                                     analysis = "Conditional")
+                                                            
+#############################################################
+#F) Mean partition (prepare plots)
+#############################################################
+                                                                     
+mean_mar_part_plot   = ggplot(mean_mar_part_final, 
+                       aes(x = quantile, y = z, color = selection, fill = selection)) + 
+                       geom_point(aes(shape = p_empirical <= 0.05), size = 1.5, stroke = 1.5) +
+                       geom_point(data = subset(mean_mar_part_final, 
+                                  p_empirical <= 0.05), aes(shape = TRUE), size = 3,  stroke = 1.5) +
+                       scale_size_identity() +
+                       scale_shape_manual(name   = "Empirical p-value", values = c(`TRUE` = 16, `FALSE` = 1),
+                                         labels = c(`TRUE` = "p <= 0.05", `FALSE` = "p > 0.05")) +
+                       geom_hline(yintercept = c(-1.96, 1.96), linetype = "dashed", color = "red", linewidth = 0.5) +
+                       geom_hline(yintercept = 0, linetype = "dashed", color = "grey", linewidth = 0.5) +
+                       geom_line(aes(group = covariate), size = 0.8, alpha = 0.5) +
+                       facet_grid(analysis + category  ~ trait) +
+                       theme_bw() +
+                       theme(legend.position  = "bottom",
+                             legend.title     = element_text(size = 10),
+                             legend.background= element_rect(fill = alpha("white", 0.8), color = "black"),
+                             legend.box       = "vertical",   
+                             legend.spacing.x = unit(6, "mm"),  
+                             strip.text       = element_text(size = 12),
+                             axis.text.x      = element_text(angle = 90, hjust = 1, vjust = 0.5),
+                             legend.key       = element_rect(fill = "transparent", color = NA)) +    
+                       scale_color_manual(name = "", values = colors_in_use, guide = guide_legend(nrow = 1)) +
+                       scale_fill_manual(name = "", values = colors_in_use, guide = guide_legend(nrow = 1)) + 
+                       labs(y = "Average effect of prioritized variants\n(Z-scores)", x = "Minimum score percentile") + 
+                       scale_x_discrete(drop = TRUE) 
+                       
+mean_con_part_plot   = ggplot(mean_con_part_final, 
+                       aes(x = quantile, y = z, color = selection, fill = selection)) + 
+                       geom_point(aes(shape = p_empirical <= 0.05), size = 1.5, stroke = 1.5) +
+                       geom_point(data = subset(mean_con_part_final,
+                                  p_empirical <= 0.05), aes(shape = TRUE), size = 3,  stroke = 1.5) +
+                       scale_size_identity() +
+                       scale_shape_manual(name   = "Empirical p-value", values = c(`TRUE` = 16, `FALSE` = 1),
+                                         labels = c(`TRUE` = "p <= 0.05", `FALSE` = "p > 0.05")) +
+                       geom_hline(yintercept = c(-1.96, 1.96), linetype = "dashed", color = "red", linewidth = 0.5) +
+                       geom_hline(yintercept = 0, linetype = "dashed", color = "grey", linewidth = 0.5) +
+                       geom_line(aes(group = covariate), size = 0.8, alpha = 0.5) +
+                       facet_grid(analysis + category ~ trait) +
+                       theme_bw() +
+                       theme(legend.position  = "bottom",
+                             legend.title     = element_text(size = 10),
+                             legend.background= element_rect(fill = alpha("white", 0.8), color = "black"),
+                             legend.box       = "vertical",   
+                             legend.spacing.x = unit(6, "mm"),  
+                             strip.text       = element_text(size = 12),
+                             axis.text.x      = element_text(angle = 90, hjust = 1, vjust = 0.5),
+                             legend.key       = element_rect(fill = "transparent", color = NA)) +    
+                       scale_color_manual(name = "", values = colors_in_use, guide = guide_legend(nrow = 1)) + 
+                       scale_fill_manual(name = "", values = colors_in_use, guide = guide_legend(nrow = 1)) + 
+                       labs(y = "Average effect of prioritized variants\n(Z-scores)", x = "Minimum score percentile") + 
+                       scale_x_discrete(drop = TRUE) 
+
+#Combined figure
+mean_part_figure    = ggpubr::ggarrange(mean_mar_part_plot, mean_con_part_plot,   
+                      labels = c("A", "B"), ncol = 1, nrow = 2, heights = c(1, 1.25), common.legend = T, legend = "bottom") 
+
+#############################################################
+#G) Mean partition (prepare table
+#############################################################
+ 
+mean_part_table     = mean_part_final %>% dplyr::select(-c("z", "category", "selection")) %>% dplyr::rename(p_analytical_joint = Joint_sig) %>% 
+                      dplyr::mutate(covariate = recode(covariate, "Positive selection (marginal)" = "B", 
+                                                                  "Negative selection (marginal)" = "D",
+                                                                  "Positive selection (main)" = "B", 
+                                                                  "Negative selection (main)" = "D",
+                                                                  "Positive selection (interaction)" = "BxE", 
+                                                                  "Negative selection (interaction)" = "DxE")) %>%
+                      dplyr::mutate(model = case_when(analysis == "Marginal" ~ "M1A", analysis == "Conditional" ~ "M1B")) %>%
+                      dplyr::select(c("analysis","model", "trait", "quantile", 
+                                      "p_analytical_joint", "covariate", "effect", "SE", "p_analytical", "p_empirical"))  %>%
+                      dplyr::rename(B = effect) 
+                
+#############################################################
+#F) Likelihood-ratio tests (unpermuted)
+#############################################################
+                                                                                                      
+LLR_test           = likelihoods_MK %>% 
+                     tidyr::pivot_wider(names_from = random_model, values_from = llik) %>%
+                     left_join(ll_SK_unpermuted , by = "trait") %>% 
+                     dplyr::mutate(LLR_M1M2  = 2 * (M2 - M1), 
+                                   LLR_M2M3  = 2 * (M3 - M2),
+                                   LLR_M1M3  = 2 * (M3 - M1),
+                                   pval_M1M2 = round(pchisq(LLR_M1M2, df=1, lower.tail=FALSE),10),
+                                   pval_M2M3 = round(pchisq(LLR_M2M3, df=1, lower.tail=FALSE),10),
+                                   pval_M1M3 = round(pchisq(LLR_M1M3, df=2, lower.tail=FALSE),10)) %>%
+                     tidyr::pivot_longer(cols = c(LLR_M1M2, LLR_M2M3, LLR_M1M3, 
+                                                  pval_M1M2, pval_M2M3, pval_M1M3), names_to = c(".value","comparison"),
+                                                                                    names_pattern = "(LLR|pval)_(.*)") %>%
+                     dplyr::select(-c("M1", "M2", "M3")) %>% 
+                     left_join(get_empirical_LLR(.), by = c("trait", "quantile", "comparison")) %>%
+                     dplyr::filter(permuted == "no") %>% 
+                     dplyr::select(trait, quantile, comparison, LLR, pval, p_empirical) %>%
+                     dplyr::mutate(comparison = factor(gsub("(M\\d)(M\\d)", "\\1-\\2", comparison), levels = c("M1-M2", "M2-M3", "M1-M3"))) %>%
+                     dplyr::mutate(signif = ifelse(p_empirical <= 0.05, "<= 0.05", "> 0.05")) %>%
+                     dplyr::mutate(signif = factor(signif, levels = c("> 0.05", "<= 0.05"))) %>%
+                     rename_traits()
+                     
+chi_thresholds     = data.frame(df = c(1, 1, 2), alpha = 0.05, 
+                                critical_chi = qchisq( p = 1 - 0.05, df = c(1, 1, 2)), comparison = c("M1-M2", "M2-M3", "M1-M3")) %>%
+                     dplyr::mutate(critical_chi = round(critical_chi, 2))
+                                   
+LLR_plot           = ggplot(LLR_test,aes(x = factor(quantile), y = LLR, color = comparison, group = comparison)) +
+                     geom_line(linewidth = 0.8) +
+                     geom_point(aes(shape = signif), size = 2, stroke = 1.2) +
+                     scale_shape_manual(name = "Empirical p-value", values = c("<= 0.05" = 16, "> 0.05" = 1)) +
+                     scale_color_viridis_d() + guides(color = "none") +
+                     geom_hline(yintercept = qchisq(0.95, df = 1), linetype = "dashed", color = "red", linewidth = 1) + 
+                     facet_grid(comparison ~ trait) +
+                     theme_bw() +
+                     labs(x = "Minimum score percentile", y = "LLR-statistics") +
+                     theme(legend.position = "bottom",
+                           strip.text  = element_text(size = 12),
+                           axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))                      
+                                                                      
+LLR_test_final     = LLR_test %>%
+                     dplyr::mutate(across(where(is.numeric), ~ round(.x, 9))) %>% dplyr::rename(p_analytical = pval) %>%
+                     dplyr::select(-c("signif"))
+
+#############################################################
+#G) Variance component plot (Single kernel)
+#############################################################
+
+component_colors   = c(G = "#440154", GS = "#482878", GN = "#3E4989", GxC = "#31688E", GSxC = "#26828E", GNxC = "#35B779", E = "#FDE725")
+
+variance_SK_df     = variance %>% 
+                     dplyr::filter(!Component %in% c("CxY", "CxR"), random_model == "M1") %>%
+                     dplyr::group_by(trait, quantile, random_model) %>%
+                     dplyr::mutate(Total_variance = sum(Variance), Relative_variance = Variance / Total_variance) %>% dplyr::ungroup() %>%
+                     rename_traits() %>% 
+                     dplyr::mutate(Component = factor(Component, levels = c("E", "GxC", "G")))
+                     
+variance_SK_plot   = ggplot(variance_SK_df, 
+                     aes(x = trait, y = Relative_variance, fill = Component), size = 2, alpha = 0.5)  +
+                     geom_bar(stat = "identity") + 
+                     labs(y = "Proportion variance explained", x = "", size = 8) +
+                     theme_bw() +
+                     scale_fill_manual(values = component_colors) +
+                     theme(axis.text.x       = element_text(size = 10, angle = 45, hjust = 1),
+                           legend.position   = c(0.85, 0.80), 
+                           legend.background = element_rect(fill = "white", color = "black"),
+                           legend.title      = element_blank())                                    
+
+#Reliability plot 
+reliability_df     = reliability_df %>% rename_traits()
+
+reliability_plot   = ggplot(reliability_df, 
+                     aes(x = trait, y = R, fill = trait), size = 2, alpha = 0.5)  +
+                     geom_bar(stat = "identity", fill = "grey60") +
+                     labs(y = "Reliability of the predicted\nadditive genetic effects", x = "", size = 8) +
+                     theme_bw() +
+                     #scale_fill_viridis_d(option = "D") +
+                     theme(legend.position = "none",
+                           plot.title      = element_text(size = 12, hjust = 0.5),
+                           strip.text      = element_text(size = 8), 
+                           axis.text       = element_text(size = 8),
+                           axis.text.x     = element_text(size = 10, angle = 45, hjust = 1)) + ylim(0,1)
+
+#############################################################
+#H) Variance components plot (Multi kernel)
+#############################################################
+
+#component_colors   = RColorBrewer::brewer.pal(6, "Spectral")
+
+scaling_factors    = kernel_info[["snps_no"]] %>%
+                     dplyr::mutate(scale_group = dplyr::recode(GRM, Base = "G", Neu = "GN", Sel = "GS")) %>%
+                     dplyr::distinct(scale_group, scaling, quantile)
+                     
+scaling_G          = scaling_factors %>% dplyr::filter(scale_group == "G") %>% dplyr::mutate(quantile = "none")
+
+scaling_factors    = rbind(scaling_factors, scaling_G) %>% distinct(scale_group, scaling, quantile)
+
+variance_MK_df     = variance %>%
+                     dplyr::filter(!Component %in% c("E", "CxY", "CxR")) %>%
+                     dplyr::select(-c(kernels, permuted, permutation)) %>%
+                     dplyr::mutate(scale_group = dplyr::case_when(Component %in% c("G", "GxC")   ~ "G", 
+                                                                  Component %in% c("GN", "GNxC") ~ "GN", 
+                                                                  Component %in% c("GS", "GSxC") ~ "GS")) %>%
+                     dplyr::left_join(scaling_factors, by = c("scale_group", "quantile")) %>%
+                     dplyr::group_by(trait, random_model, quantile) %>%
+                     dplyr::mutate(Variance_rescaled = Variance / scaling, proportion = Variance_rescaled / sum(Variance_rescaled, na.rm = TRUE)) %>%
+                     dplyr::ungroup() %>%
+                     dplyr::mutate(Component = factor(Component, levels = c("G", "GS", "GN", "GxC", "GSxC", "GNxC")),
+                                   quantile = factor(quantile, levels = c("none", sort(setdiff(unique(quantile), "none"))))) %>%
+                     rename_traits() %>%
+                     dplyr::filter(!(random_model == "M1" & quantile != "none")) %>%
+                     droplevels()
+
+Variance_MK_plot   = ggplot(
+                     variance_MK_df, aes(x = random_model, y = proportion, fill = Component)) +
+                     geom_col() +
+                     scale_x_discrete(drop = TRUE) +
+                     scale_fill_manual(values = component_colors) +
+                     labs(x = "", y = "Proportion of genetic variance (scaled)") +
+                     theme_bw() +
+                     theme(legend.position = "bottom", axis.text.x = element_text(angle = 45, hjust = 1)) +
+                     facet_grid(trait ~ quantile, scales = "free_x") +
+                     guides(fill = guide_legend(nrow = 1, byrow = TRUE))
+                                                                                                                                        
+#############################################################
+#I) Validation
+#############################################################
+
+#QGG
+validation_upd_qgg  = validation_qgg %>% 
+                      group_by(trait, quantile, random_model, fixed_model, permuted, permutation) %>% 
+                      summarise(PA = mean(Corr, na.rm = TRUE), SE = sd(Corr, na.rm = TRUE) / sqrt(n()), .groups = "drop") %>%
+                      rename_traits()
+                                                   
+GP_baseline_qgg     = validation_upd_qgg %>%
+                      dplyr::filter(permuted == "no", random_model == "M1", fixed_model == "X1") %>%
+                      dplyr::select(c("trait", "PA", "SE")) %>% dplyr::rename(PA_baseline = PA) %>% distinct(trait, PA_baseline, SE)
+                      
+GP_extended_qgg     = validation_upd_qgg %>% 
+                      left_join(GP_baseline_qgg %>% dplyr::select(trait, PA_baseline), by = "trait") %>%
+                      dplyr::mutate(improv = PA - PA_baseline) %>%
+                      dplyr::filter(permuted == "no", !(random_model == "M1" & fixed_model == "X1")) %>%
+                      dplyr::select(-c("permuted", "permutation", "SE", "PA", "PA_baseline")) %>%
+                      dplyr::mutate(across(where(is.numeric), ~ round(.x, 7))) %>%
+                      dplyr::filter(!is.na(improv)) %>% 
+                      pivot_wider(names_from  = quantile, values_from = improv) %>%
+                      mutate(model = case_when(random_model == "M1" & fixed_model == "X2" ~ "M1A",
+                                               random_model == "M1" & fixed_model == "X3" ~ "M1B",
+                                               random_model == "M2" & fixed_model == "X1" ~ "M2",
+                                               random_model == "M3" & fixed_model == "X1" ~ "M3", TRUE ~ NA_character_)) %>%
+                      dplyr::filter(!is.na(model)) %>% dplyr::select(-c("random_model", "fixed_model")) %>%
+                      pivot_longer(cols = -c(trait, model), names_to = "quantile",values_to = "improv") 
+                      
+#############################################################
+
+#MM4LMM
+validation_upd_MM4LMM = validation_MM4LMM %>%
+                        group_by(trait, quantile, random_model, fixed_model, fold) %>%
+                        summarise(Corr = cor(predicted, observed, use = "complete.obs"), .groups = "drop") %>%
+                        group_by(trait, quantile, random_model, fixed_model) %>%
+                        summarise(PA = mean(Corr, na.rm = TRUE), SE = sd(Corr, na.rm = TRUE) / sqrt(sum(!is.na(Corr))), .groups = "drop") %>%
+                        rename_traits()
+                                                   
+GP_baseline_MM4LMM    = validation_upd_MM4LMM %>%
+                        dplyr::filter(random_model == "M1", fixed_model == "X1") %>%
+                        dplyr::select(c("trait", "PA", "SE")) %>% dplyr::rename(PA_baseline = PA) %>% distinct(trait, PA_baseline, SE)
+                      
+GP_extended_MM4LMM    = validation_upd_MM4LMM %>% 
+                        left_join(GP_baseline_MM4LMM %>% dplyr::select(trait, PA_baseline), by = "trait") %>%
+                        dplyr::mutate(improv = PA - PA_baseline) %>%
+                        dplyr::filter(!(random_model == "M1" & fixed_model == "X1")) %>%
+                        dplyr::select(-c("SE", "PA", "PA_baseline")) %>%
+                        pivot_wider(names_from  = quantile, values_from = improv) %>%
+                        dplyr::mutate(model = case_when(random_model == "M1" & fixed_model == "X2" ~ "M1A",
+                                                        random_model == "M1" & fixed_model == "X3" ~ "M1B",
+                                                        random_model == "M2" & fixed_model == "X1" ~ "M2",
+                                                        random_model == "M3" & fixed_model == "X1" ~ "M3", TRUE ~ NA_character_)) %>%
+                        dplyr::filter(!is.na(model)) %>% 
+                        dplyr::select(-c("random_model", "fixed_model")) %>%
+                        pivot_longer(cols = -c(trait, model), names_to = "quantile",values_to = "improv") 
+
+#############################################################
+
+GP_baseline         = GP_baseline_qgg
+                      
+GP_baseline_plot    = ggplot(GP_baseline, aes(x = trait, y = PA_baseline)) +
+                      geom_col(fill = "grey60", width = 0.7) +
+                      geom_errorbar(aes(ymin = PA_baseline - SE, ymax = PA_baseline + SE), width = 0.2) +
+                      labs(x = "", y = "Prediction accuracy") +
+                      theme_bw() +
+                      theme(axis.text.x = element_text(angle = 45, hjust = 1),
+                            axis.text   = element_text(size = 9),
+                            axis.title  = element_text(size = 10)) +
+                      ylim(0, 1)
+
+GP_extended         = GP_extended_qgg
+
+GP_extended_plot    = ggplot(GP_extended, aes(x = quantile, y = improv, colour = model, group = model)) +
+                      geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+                      geom_line(linewidth = 0.8) +
+                      geom_point(size = 2) +
+                      facet_wrap(~ trait) +
+                      scale_colour_viridis_d(option = "D") +
+                      labs(x = "Minimum score percentile", y = "Improvement in prediction accuracy", colour = "Model") +
+                      theme_bw() +
+                      theme(legend.position = "bottom", 
+                            strip.text      = element_text(size = 10), 
+                            axis.text       = element_text(size = 9),
+                            axis.title      = element_text(size = 10)) +ylim(-0.01, 0.01)
+                                         
+#############################################################
+#J) Phenotypic analyses (spatial models)
+#############################################################
+
+#Function
+extract_spatial_models = function(traits, countries, years, regions, analysis) {
+  
+model_info  = purrr::map_dfr(traits, function(trait) { purrr::map_dfr(countries, function(country) { region_info = regions[[trait]][[country]]
+         
+         
+         if (is.list(region_info)) {
+            
+            purrr::map_dfr(years, function(year) {
+                
+expand.grid(trait = trait, country = country, year = year, region = region_info[[as.character(year)]], analysis = analysis,stringsAsFactors = FALSE)})
+            
+          } else {
+            
+expand.grid(trait = trait, country = country, year = years, region = region_info, analysis = analysis, stringsAsFactors = FALSE)}})}) %>%
+            dplyr::mutate(file = paste0(spatial_models,"BLUES_", trait, "_", country, year, "_R", region, ".rds"),
+      model = purrr::map(file, readRDS),
+      spatial_function = purrr::map_chr(model, ~ .x$formula$random %>% as.character() %>% paste(collapse = "") %>% sub("^~", "", .))) %>%
+      dplyr::select(trait, country, year, region, analysis, spatial_function) %>% rename_traits()
+  
+  return(model_info) }
+
+#############################################################
+
+traits            = c("Heading date", "Plantheight", "Protein", "Yield")
+countries         = c("DE", "DK")
+years             = c(2021, 2022, 2023)
+analysis          = "GP"
+regions           = list("Heading date" = list(DE = 4, DK = 3), 
+                         "Plantheight" = list(DE = 4, DK = 3), 
+                         "Protein" = list( DE = 4, DK = c(2, 3)),
+                         "Yield" = list(DE = 4, DK = c(2, 3)))
+
+#############################################################
+
+traits            = c("Protein", "Yield")
+countries         = c("DK")
+years             = c(2015:2020)
+analysis          = "GWAS"
+regions           = list("Protein" = list(DK = list(`2015` = c(2, 3), `2016` = c(2, 3), `2017` = c(2, 3), 
+                                                    `2018` = 3, `2019` = c(2, 3),`2020` = c(2, 3))),
+                         "Yield"   = list(DK = list(`2015` = c(2, 3), `2016` = c(2, 3), `2017` = c(2, 3), 
+                                                    `2018` = 3, `2019` = c(2, 3), `2020` = c(2, 3))))
+
+
+spatial_table_GP     = extract_spatial_models(traits, countries, years, regions, analysis)
+spatial_table_GWAS   = extract_spatial_models(traits, countries, years, regions, analysis)
+spatial_models_table = list("GP" = spatial_table_GP, "GWAS" = spatial_table_GWAS)
+
+#############################################################
+#K) Figures
+#############################################################
+
+#Main
+F3   = mean_part_figure
+ggsave(paste0(path_figures, "F3.png"), plot = F3, width = 8, height = 9, dpi = 500)
+
+F4   = LLR_plot 
+ggsave(paste0(path_figures, "F4.png"), plot = F4, width = 8, height = 5, dpi = 500)
+
+F5   =  ggarrange(GP_baseline_plot, GP_extended_plot, labels = c("A", "B"), widths = c(1,2))
+ggsave(paste0(path_figures, "F5.png"), plot = F5, width = 10, height = 4, dpi = 500)
+
+#Supplementary
+S2                 = ggpubr::ggarrange(variance_SK_plot, reliability_plot, labels = c("A", "B"), ncol = 2, nrow = 1, common.legend = F)
+ggsave(paste0(path_figures, "S2.png"), S2, height = 4, width = 7, dpi = 500) 
+
+S3                 = Variance_MK_plot
+ggsave(paste0(path_figures, "S3.png"), plot = S3, width = 6, height = 7, dpi = 500)
+
+#############################################################
+#L) Tables (In main or supplementary)
+#############################################################
+
+write_xlsx(mean_part_table, paste0(path_tables,"TS2_mean_partition_Wald_test.xlsx")) 
+write_xlsx(LLR_test_final, paste0(path_tables,"TS3_variance_partition_LLR_test.xlsx"))
+
+#############################################################
+#M) Tables (Not in main or supplementary)
+#############################################################
+
+write_xlsx(spatial_table_GP, paste0(path_tables,"not_manuscript/T0G_GP_spatial_models_table.xlsx"))
+write_xlsx(spatial_table_GWAS, paste0(path_tables,"not_manuscript/T0H_GWAS_spatial_models_table.xlsx"))
+
+write_xlsx(heritability_df, paste0(path_tables,"not_manuscript/T0I_variance_partition_reliability.xlsx"))
+write_xlsx(chi_thresholds, paste0(path_tables,"not_manuscript/T0J_variance_partition_chitest_thresholds.xlsx"))
+write_xlsx(GP_baseline, paste0(path_tables,"not_manuscript/T0K_validation_baseline.xlsx"))
+
+#############################################################
+#############################################################
