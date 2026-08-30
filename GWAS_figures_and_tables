@@ -1,0 +1,961 @@
+#############################################################
+options(bitmapType = "cairo")
+library(adegenet)
+library(CMplot)
+library(colorspace)
+library(data.table)
+library(dendextend)
+library(dplyr)
+library(emmeans)
+library(jpeg)
+library(GenomicRanges)
+library(ggbreak)
+library(ggplot2)
+library(ggpubr)
+library(grid)
+library(gridExtra)
+library(mgcv)
+library(minpack.lm)
+library(patchwork)
+library(purrr)
+library(ragg)
+library(RColorBrewer)
+library(rtracklayer)
+library(scales)
+library(stringr)
+library(tibble)
+library(tidyr)
+library(tidygam)
+library(tidymv)
+library(viridis)
+library(writexl)
+#############################################################
+#A) Paths 
+#############################################################
+ 
+submission          = "submission2"
+
+current_path        = getwd()
+
+path                = "/home/tasha/breedfuture/"
+
+path_map            = paste0(path, "raw_data/WW/geno/plink/all_data/")
+
+path_input          = paste0(path, "prepared_data/", submission, "/")  
+
+path_models         = paste0(path, "output/", submission, "/")
+
+path_figures        = paste0(path, "results/", submission, "/figures/")
+
+path_tables         = paste0(path, "results/", submission, "/tables/")
+
+path_raw            = "/faststorage/project/breedfuture/raw_data/WW/geno/plink/all_data/"
+
+#############################################################
+#B) Parameters
+#############################################################
+
+quantiles           = c(0, seq(0.30, 0.90, by = 0.20), 0.95, 0.99)
+
+Chr_order           = c(paste0(rep(1:7, times = 3), rep(c("A", "B", "D"), each = 7)))
+                                                    
+analysis_colors     = c(GP = "#440154", GWAS = "#21918C", SSA = "grey")
+
+#############################################################
+#C) Functions
+#############################################################
+
+#Function 1
+generate_data       = function(n, means, sds, groups, scenario) {
+
+data                = do.call(rbind, lapply(seq_along(means), function(i) {
+
+data.frame(y = rnorm(n, mean = means[i], sd = sds[i]), group = groups[i], scenario = scenario)}))
+
+return(data)}
+                                           
+#############################################################
+#D) Load data
+#############################################################
+
+SNPs_exclude      = readLines(paste0(path_raw, "missing_SNPs_final.txt"))
+
+imputation_check  = readRDS(paste0(path_input, "imputation/imputation_check_results.rds"))
+
+GRM_G             = readRDS(paste0(path_input, "kinships/GRM_baseline.rds"))
+
+SSA_output        = readRDS(paste0(path_input, "SSA/SSA_output_GMMAT_threshold_50_final.rds")) %>% 
+                    dplyr::filter(converged == TRUE, !SNP %in% SNPs_exclude) 
+                    
+SSA_input         = readRDS(paste0(path_input, "genotypes/SSA_input_list.rds"))[["50"]]
+
+SSA_input         = SSA_input[,  intersect(SSA_output$SNP, colnames(SSA_input)), drop = FALSE]
+SSA_output        = SSA_output %>% dplyr::filter(SNP %in% colnames(SSA_input))
+n                 = ncol(SSA_input)
+print(n)
+
+data_list         = readRDS(paste0(path_input, "phenotypes/prepared_data_list.rds"))
+samples_GP        = data_list[["GP"]] %>% pull(id) %>% unique() 
+samples_GWAS      = data_list[["GWAS"]] %>% pull(id) %>% unique() 
+samples_all       = c(samples_GP, samples_GWAS)
+
+geno              = readRDS(paste0(path_input, "genotypes/geno_with_IDs_validation.rds"))[samples_all, SSA_output$SNP] %>% as.matrix()
+
+map               = read.table(paste0(path_map, "ww_updated_final.map"), header=F,col.names=c("CHROM","SNP","DIST","POS")) %>% 
+                    dplyr::mutate_at(vars(POS), as.numeric) 
+                     
+LDdecay           = readRDS(paste0(path_models, "LDdecay.rds")) 
+
+GWAS_list         = readRDS(paste0(path_models,"GWAS_marginal_final_submission2.rds")) 
+
+key_SNPs          = readRDS(paste0(path_input, "genotypes/SNP_key.rds")) 
+
+genome_size       = read.table(paste0(path_input, "fasta/chromosome_lengths.txt"), header = FALSE, sep = " ", stringsAsFactors = FALSE)
+colnames(genome_size) = c("CHROM", "END")
+
+loads             = readRDS(paste0(path_input, "loads/loads_unpermuted.rds"))
+               
+#Annotations 
+gff               = import(paste0(path_input, "annotations/iwgsc_refseqv2.1_gene_annotation_200916/iwgsc_refseqv2.1_annotation_200916_HC.gff3"))
+genes             = gff[gff$type == "gene"]  
+
+annotations_func  = read.csv(paste0(path_input, "annotations/iwgsc_refseqv2.1_functional_annotation.csv"),stringsAsFactors = FALSE)
+                                
+#############################################################
+#E) PCA plot
+#############################################################
+
+PCA               = prcomp(geno[samples_GP, ], center = T, scale = F) 
+
+PCs               = PCA$x %>% as.data.frame() %>% 
+                    dplyr::select(c("PC1", "PC2", "PC3")) %>% rownames_to_column("id")
+                     
+geno_clustering   = geno[samples_GP, ] %>%
+                    dist(method = "euclidean") %>% hclust(method = "ward.D") %>% as.dendrogram() %>%
+                    color_branches(k = 10) %>% color_labels(k = 10) %>% cutree(k = 10) %>% as.data.frame()
+
+colnames(geno_clustering) = "cluster"
+
+geno_clustering = geno_clustering %>%
+                  tibble::rownames_to_column("id")
+
+passport          = data.frame("id" = samples_GP) %>% left_join(PCs, by = "id") %>% left_join(geno_clustering, by = "id") 
+                     
+cluster_colors    = setNames(viridis::viridis(length(levels(factor(passport$cluster))), option = "D"), levels(factor(passport$cluster)))
+
+PCA_cluster_plot  = passport %>%
+                    ggplot(aes(x = PC1, y = PC2,fill = as.factor(cluster))) +
+                    geom_point(shape = 21, size = 2, alpha = 0.8, stroke = 0.1, color = "black") +
+                    labs(fill = "Genetic cluster",
+                         x     = sprintf("PC1 (%.2f%%)", (PCA$sdev[1]^2 / sum(PCA$sdev^2) * 100)),
+                         y     = sprintf("PC2 (%.2f%%)", (PCA$sdev[2]^2 / sum(PCA$sdev^2) * 100))) +
+                    theme_bw() +
+                    theme(legend.position       = c(0.5, 0.02),   
+                          legend.justification  = c(0.5, 0),
+                          legend.direction      = "horizontal",
+                          legend.box.background = element_rect(color = "black", fill = NA, linewidth = 0.6),
+                          legend.background     = element_blank(),
+                          legend.key            = element_blank(),
+                          legend.title          = element_text(size = 11, hjust = 0.5, face = "bold"),
+                          legend.title.align    = 0.5,
+                          legend.text           = element_text(size = 9),
+                          legend.spacing.x      = unit(0.25, "cm")) +   
+                    scale_fill_manual(values = cluster_colors) +  
+                    guides(fill = guide_legend(nrow = 1, title.position = "top", override.aes = list(size = 3.5))) +
+                    xlim(-30, 65) + ylim(-50, 60)
+                             
+#############################################################
+#G) LDdecay, model
+#############################################################
+
+#Model
+LDdecay_upd        = dplyr::bind_rows(LDdecay) %>% dplyr::filter(is.finite(D), is.finite(r2), D > 0) %>% arrange(adjustment, D)
+
+pred_data          = LDdecay_upd %>% group_split(adjustment) %>% map_dfr(function(df) {
+
+model              = glm(r2 ~ D, data = df, family = Gamma(link = "inverse"))
+
+newdata            = tibble(D = seq(0, max(df$D, na.rm = TRUE), length.out = 1000), adjustment = unique(df$adjustment))
+
+newdata$r2_pred    = predict(model, newdata = newdata, type = "response")
+
+newdata })
+
+#Thresholds
+get_LD_threshold   = function(current_data, r2_values = c(0.1, 0.2, 0.3, 0.4, 0.5)) {
+
+      current_model= glm(r2 ~ D, data = current_data, family = Gamma(link = "inverse"))
+
+       coef_model  = coef(current_model)
+  
+       thresholds  = data.frame(r2 = r2_values, D_kbp = round(((1 / r2_values - coef_model["(Intercept)"]) / coef_model["D"]) / 1000,0)) %>%
+                     mutate(adjustment = unique(current_data$adjustment))
+  
+        return(thresholds) }
+        
+thresholds_LD      = data.frame()
+
+    for(current_adjustment in unique(LDdecay_upd$adjustment)) {
+    
+    input          = LDdecay_upd %>% dplyr::filter(adjustment == current_adjustment)
+
+    temp           = get_LD_threshold(input) 
+    
+    thresholds_LD  = rbind(thresholds_LD, temp) }
+    
+#############################################################
+#H) LDdecay, plots
+#############################################################
+
+LD_decay_v1_plot   = ggplot(LDdecay_upd, aes(x = D/1000, y = r2)) +
+                     geom_point(alpha = 0) +
+                     geom_line(data = pred_data, 
+                     aes(x = D/1000, y = r2_pred, color = adjustment), linewidth = 1) +
+                     geom_hline(yintercept = 0.2, color = "red", linetype = "dashed") +
+                     labs(x = "Distance (kbp)", y = expression(LD~(r^2)), color = "Adjustment") +
+                     theme_bw() +
+                     theme(legend.position      = c(0.98, 0.98), 
+                           legend.justification = c("right", "top"), 
+                           legend.background    = element_rect( fill = "white", color = "black", linewidth = 0.3),
+                           legend.margin        = margin(5, 15, 5, 5)) +
+                     scale_color_viridis_d(option = "D") +
+                     scale_x_continuous(limits = c(0, 10000), breaks = seq(0, 10000, length.out = 5), labels = comma)
+                     
+LD_decay_v2_plot   = ggplot(LDdecay_upd %>% dplyr::filter(adjustment == "Q+K"), aes(x = D/1000, y = r2)) + 
+                     geom_point(alpha = 0) +
+                     geom_line(data = pred_data %>% dplyr::filter(adjustment == "Q+K"), 
+                     aes(x = D/1000, y = r2_pred), color = "black", linewidth = 1) +
+                     geom_hline(yintercept = 0.2, color = "red", linetype = "dashed") +
+                     labs(x = "Distance (kbp)", y = expression(LD~(r^2))) +
+                     theme_bw() +
+                     theme(legend.position   = "none", 
+                           legend.box.margin = margin(-10, 0, 0, 0),                           
+                           panel.background  = element_rect(fill = "transparent", color = NA),
+                           plot.background  = element_rect(fill = "transparent", color = NA)) +
+                    scale_x_continuous(limits = c(0, 1000), breaks = seq(0, 1000, by = 250), labels = comma)
+                  
+LD_grob            = ggplotGrob(LD_decay_v2_plot)
+
+PCA_cluster_LD_plot= PCA_cluster_plot + annotation_custom(grob = LD_grob, xmin = 17, xmax = 68, ymin = 15,ymax = 65)
+
+#############################################################
+#I) Genome coverage & LD
+#############################################################
+  
+LDblocks           = data.frame()
+
+for(current_threshold in c(0.1, 0.2)) {
+   
+  LD_kbp           = thresholds_LD %>% dplyr::filter(adjustment == "Q+K", r2 == current_threshold) %>% dplyr::pull(D_kbp)
+
+  LD_bp            = LD_kbp * 1000
+
+  intervals        = SSA_output %>%
+                     dplyr::left_join(map, by = "SNP") %>%
+                     dplyr::filter(!is.na(CHROM), CHROM != "ChrUnknown") %>%
+                     dplyr::select(CHROM, POS) %>%
+                     dplyr::mutate(start = POS - LD_bp, end = POS + LD_bp) %>%
+                     dplyr::left_join(genome_size %>% dplyr::mutate(CHROM = sub("^Chr", "", CHROM)), by = "CHROM") %>%
+                     dplyr::mutate(start = pmax(start, 1), end = pmin(end, END)) %>%
+                     dplyr::select(CHROM, start, end) %>% as.data.table()
+
+  setorder(intervals, CHROM, start)
+
+  intervals[, running_end := cummax(end), by = CHROM]
+
+  intervals[, grp := cumsum(start > c(running_end[1], running_end[-.N])), by = CHROM]
+
+  merged           = intervals[, .(start = min(start), end = max(end)), by = .(CHROM, grp)]
+
+  chr_coverage     = merged[, .(covered_bp = sum(end - start + 1)), by = CHROM] %>%
+                     dplyr::left_join(genome_size %>% 
+                     dplyr::mutate(CHROM = sub("^Chr", "", CHROM)), by = "CHROM")
+
+  genome_coverage = chr_coverage %>%
+                    dplyr::summarise(covered_bp = sum(covered_bp), genome_bp = sum(END)) %>%
+                    dplyr::mutate(coverage_pct = round(100 * covered_bp / genome_bp, 1), LD_kbp = LD_kbp, threshold = current_threshold)
+
+  LDblocks        = rbind(LDblocks, genome_coverage) }
+
+#############################################################
+#J) Allele frequencies, GP, GWAS and SSA
+############################################################# 
+
+#SSA
+SSA_allele_freq     = data.frame(SNP = colnames(SSA_input), AF = colSums(SSA_input, na.rm = TRUE) / (2 * colSums(!is.na(SSA_input)))) %>%
+                      mutate(MAF = pmin(AF, 1 - AF), "Analysis" = "SSA")                  
+print(min(SSA_allele_freq$MAF))
+
+MAF_start_end_df    = SSA_input %>% as.data.frame() %>%
+                      dplyr::mutate(crossing_year = as.numeric(substring(rownames(.), 2, 3))) %>%
+                      dplyr::filter(crossing_year %in% c(13, 20)) %>% group_by(crossing_year) %>%
+                      summarise(across(everything(), ~ mean(.x, na.rm = TRUE) / 2)) %>%
+                      pivot_longer(-crossing_year, names_to = "SNP", values_to = "MAF") %>%
+                      pivot_wider(names_from = crossing_year, values_from = MAF, names_prefix = "MAF_") %>%
+                      dplyr::rename(MAF_start = MAF_13, MAF_end = MAF_20)
+                      
+SSA_crossing_table  = SSA_input %>% as.data.frame() %>%
+                      dplyr::mutate(crossing_year = as.numeric(substring(rownames(.), 2, 3))) %>%
+                      dplyr::filter(crossing_year %in% c(13:20)) %>% group_by(crossing_year) %>% count(crossing_year, name = "n_samples")
+
+#GWAS
+geno_GWAS           = geno[samples_GWAS, , drop = FALSE]
+GWAS_allele_freq    = data.frame(SNP = colnames(geno_GWAS), AF = colSums(geno_GWAS, na.rm = TRUE) / (2 * colSums(!is.na(geno_GWAS)))) %>%
+                      dplyr::mutate(MAF = pmin(AF, 1 - AF), "Analysis" = "GWAS")
+print(min(GWAS_allele_freq$MAF))
+
+#GP
+geno_GP             = geno[samples_GP, , drop = FALSE]
+GP_allele_freq      = data.frame(SNP = colnames(geno_GP), AF = colSums(geno_GP, na.rm = TRUE) / (2 * colSums(!is.na(geno_GP)))) %>%
+                      mutate(MAF = pmin(AF, 1 - AF), "Analysis" = "GP")
+print(min(GP_allele_freq$MAF))
+
+MAF_df              = bind_rows(SSA_allele_freq, GWAS_allele_freq, GP_allele_freq) %>%
+                      dplyr::mutate(Analysis = factor(Analysis, levels = c("SSA", "GWAS", "GP")))
+
+MAF_plot            = ggplot(MAF_df, aes(x = MAF, fill = Analysis)) +
+                      geom_histogram(bins = 100, alpha = 0.5, position = "identity", color = "black") +
+                      facet_wrap(~Analysis, ncol = 1) +
+                      scale_fill_manual(values = analysis_colors) +
+                      xlab("Minor allele frequency (MAF)") + ylab("Number of SNPs") +
+                      theme_bw() +
+                      theme(legend.position = "bottom") 
+                      
+MAF_plot            = ggarrange(MAF_plot, labels = c("A"), ncol = 1, nrow = 1) 
+                                          
+#############################################################
+#K) SSA, prepare output
+#############################################################
+                  
+SSA_output_upd     = SSA_output %>%
+                     left_join(map, by = "SNP") %>% 
+                     dplyr::mutate(Pval  = 2 * pnorm(abs(S), lower.tail = FALSE), 
+                                   FDR   = p.adjust(Pval, method = "fdr"),
+                                   CHROM = factor(CHROM, Chr_order)) %>% 
+                     dplyr::select(c("SNP", "Effect", "SE", "S", "CHROM", "POS", "Pval", "FDR")) %>%
+                     dplyr::filter(!is.na(CHROM), !is.na(POS))
+                            
+print(dim(SSA_output_upd))                                             
+summary(SSA_output_upd$Pval)
+summary(SSA_output_upd$FDR)
+
+max_S              = max(abs(SSA_output_upd$S), na.rm = TRUE)
+
+#Distribution
+S_quantiles        = round(quantile(abs(SSA_output_upd$S), probs = c(seq(0.30, 0.90, by = 0.20), 0.95, 0.99), na.rm = TRUE), 2)
+
+SSA_distribution   = ggplot(SSA_output_upd, aes(x = S)) +
+                     geom_histogram(aes(y = after_stat(density)), bins = 1000, fill = "grey70", color = "white") +
+                     geom_density(color = "black", linewidth = 1) +
+                     geom_vline(xintercept = c(-S_quantiles, S_quantiles), linetype = "dashed", color = "red") +
+                     labs(x = "Z-scores (SSA)", y = "Density") +
+                     theme_bw() + xlim(- max_S, max_S)
+                            
+#############################################################
+#L) SSA, Manhattan plot
+#############################################################  
+
+S_Pval_threshold    = qnorm(1 - 0.05 / 2)
+
+S_FDR_threshold     = min(abs(SSA_output_upd$S[SSA_output_upd$FDR < 0.05]), na.rm = TRUE)
+print(paste("FDR threshold (SSA)", S_FDR_threshold))
+                      
+SSA_manhattan_plot_v1 = ggplot(SSA_output_upd, aes(x = POS, y = S, size = abs(S))) + 
+                      geom_point(shape = 21, fill = "grey", color = "black", stroke = 0.025, alpha = 1) +
+                      facet_grid(~ CHROM, space = "free_x", scales = "free_x") +
+                      geom_hline(yintercept = c(-S_Pval_threshold, S_Pval_threshold), 
+                                 linetype = "dashed", color = "firebrick", linewidth = 0.7, alpha = 1) +
+                      theme(legend.position  = "none",
+                            axis.text.x      = element_blank(),
+                            panel.background = element_blank(),
+                            panel.grid.major = element_blank(),
+                            panel.grid.minor = element_blank(),
+                            axis.line        = element_line(colour = "black"),
+                            strip.background = element_blank(),
+                            strip.text       = element_text(size = 8), 
+                            plot.title       = element_text(size = 14, hjust = 0.5)) +
+                      scale_size_continuous(range = c(0.1, 3), guide = "none") +
+                      ylab("Z-scores (SSA)") + xlab("Position (bp)") + ylim(- max_S, max_S)
+                      
+SSA_manhattan_plot_v2 = ggplot(SSA_output_upd, aes(x = POS, y = -log10(FDR), size = -log10(FDR))) + 
+                      geom_point(shape = 21, fill = "grey", color = "black", stroke = 0.025, alpha = 1) +
+                      facet_grid(~ CHROM, space = "free_x", scales = "free_x") +
+                      geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "firebrick", linewidth = 0.8, alpha = 1) +
+                      scale_y_break( c(10, 35), scales = 0.5) +
+                      theme(legend.position  = "none",
+                            axis.text.x      = element_blank(),
+                            panel.background = element_blank(),
+                            panel.grid.major = element_blank(),
+                            panel.grid.minor = element_blank(),
+                            axis.line        = element_line(colour = "black"),
+                            strip.background = element_blank(),
+                            strip.text       = element_text(size = 8), 
+                            plot.title       = element_text(size = 14, hjust = 0.5)) +
+                       scale_size_continuous(range = c(1, 3), guide = "none") +
+                       ylab(expression(-Log[10] ~ "(FDR)" ~ "(SSA)")) + xlab("Position (bp)") 
+                                                                                          
+#############################################################
+#M) SSA, QQplot
+############################################################# 
+
+chisq                = qchisq(1 - SSA_output_upd$Pval, df = 1)
+lamda                = median(chisq, na.rm = TRUE)/ qchisq(0.5, df= 1)
+SSA_lamda            = round(lamda, 2)
+print(paste("Inflation value for SSA (with kinship and PCs) ", SSA_lamda))
+                                            
+#QQplot                      
+SSA_output_QQ       = SSA_output_upd %>% 
+                      dplyr::select(c("SNP", "CHROM", "POS", "Pval")) %>% dplyr::rename("SSA" = "Pval")
+                    
+        CMplot(Pmap = SSA_output_QQ, col = c("grey"), plot.type = c("q"),
+                      threshold = c(0.05/n), threshold.col = c('black'), threshold.lwd = 2, 
+                      points.alpha = 75, signal.cex = 3, multraits = F, multracks = F, amplify = TRUE,
+                      file.output = TRUE, main = , file = "jpg", file.name = "SSA_plot") 
+
+SSA_QQ_plot          = readJPEG(paste0(current_path, "/QQplot.SSA_plot.jpg"))
+                                                              
+SSA_QQ_plot          = ggplot() + annotation_raster(SSA_QQ_plot, xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf) + theme_void()
+
+#Proprotion significant (FDR)
+SSA_table_prop       = SSA_output_upd %>% dplyr::filter(FDR <= 0.05) %>% 
+                       summarise(n_total = n(), n_pos = sum(S > 0, na.rm = TRUE), n_neg= sum(S < 0, na.rm = TRUE),
+                       prop_pos = round(mean(S > 0, na.rm = TRUE),3), prop_neg = round(mean(S < 0, na.rm = TRUE),3)) %>% 
+                       mutate(analysis = "SSA", "lamda" = SSA_lamda)
+                                                                                        
+#############################################################
+#N) GWAS, prepare output
+############################################################# 
+
+GWAS_output         = data.frame()
+  
+for(current_trait in names(GWAS_list)){  
+   
+   current_GWAS           = GWAS_list[[current_trait]]
+
+   SNP_results            = lapply(names(current_GWAS), function(SNP) {
+        
+   VarBeta                = current_GWAS[[SNP]]$VarBeta
+   Beta                   = current_GWAS[[SNP]]$Beta
+
+   terms_to_use           = which(rownames(VarBeta) %in% c("Xeffect"))
+                                            
+   pval                   = aod::wald.test(Sigma = VarBeta, b = Beta, Terms = c(terms_to_use))$result$chi2["P"]
+
+   data.table("trait"     = current_trait, 
+              "SNP"       = SNP, 
+              "GWAS_pval" = pval, 
+              "GWAS_B"    = Beta[terms_to_use], 
+              "GWAS_SE"   = sqrt(VarBeta[terms_to_use, terms_to_use])) }) 
+
+   SNP_results            = rbindlist(SNP_results)
+
+   GWAS_output            = rbind(GWAS_output, SNP_results) }  
+   
+   GWAS_df                = GWAS_output %>% 
+                            left_join(SSA_output_upd[,c("SNP", "CHROM", "POS", "S")], by = "SNP") %>%
+                            dplyr::mutate(trait = recode(trait, "Protein" = "GPD", "Plantheight" = "Plant height")) %>% 
+                            split(.$trait)
+                                                   
+   GWAS_df                = lapply(GWAS_df, function(df) { df$GWAS_FDR = p.adjust(df$GWAS_pval, method = "fdr") 
+                                        df }) %>% do.call(rbind, .) 
+                                                           
+#############################################################
+#O) GWAS, Manhattan plot
+############################################################# 
+
+trait_colors        = viridis(n = length( c("GPD", "Yield")), option = "viridis")
+names(trait_colors) = c("GPD", "Yield")
+
+GWAS_upd_df         = GWAS_df %>% 
+                      dplyr::mutate(GWAS_FDR = pmax(GWAS_FDR, .Machine$double.xmin)) %>%
+                      dplyr::select(SNP, POS, CHROM, trait, GWAS_FDR, GWAS_pval) %>%
+                      dplyr::mutate(CHROM = factor(CHROM, Chr_order)) %>% 
+                      dplyr::filter(SNP %in% colnames(SSA_input))
+
+GWAS_manhattan_plot = ggplot() + 
+                      geom_point(data = GWAS_upd_df, aes(x = POS, y = -log10(GWAS_FDR), colour = trait), alpha = 0.75) +
+                      facet_grid(. ~ CHROM, scales = "free_x", space = "free_x") + 
+                      geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+                      theme(legend.position      = c(0.98, 0.98), 
+                            legend.justification = c(1, 1), 
+                            legend.direction     = "horizontal",
+                            legend.box.margin    = margin(0, 0, 0, 0),
+                            legend.background    = element_rect(fill = alpha("white", 0.7), color = "black"),
+                            axis.text.x          = element_blank(),
+                            axis.line            = element_line(colour = "black"),
+                            panel.background     = element_blank(),
+                            panel.grid.major     = element_blank(),
+                            panel.grid.minor     = element_blank(),
+                            strip.text           = element_text(size = 8),
+                            strip.background     = element_blank()) +
+                      scale_color_manual(values = trait_colors, name = "Trait") +
+                      guides(color = guide_legend(nrow = 2, title.theme = element_text(face = "bold", size = 10), override.aes = list(size = 4.5))) +
+                      ylab(expression(-Log[10] ~ "(FDR)" ~ "(GWAS)")) + xlab("Position (bp)") 
+                                                                       
+#############################################################
+#P) GWAS, QQplot
+############################################################# 
+
+#Genomic inflation
+GPD                  = GWAS_upd_df %>% dplyr::filter(trait %in% c("Protein", "GPD"))
+GPD_chisq            = qchisq(1 - GPD$GWAS_pval, df = 1)
+GWAS_GPD_lamda       = round(median(GPD_chisq, na.rm = TRUE)/ qchisq(0.5, df= 1), 2)
+print(paste("Inflation value for GWAS, GPD", GWAS_GPD_lamda))
+
+#Genomic inflation
+Yield                = GWAS_upd_df %>% dplyr::filter(trait %in% c("Yield"))
+Yield_chisq          = qchisq(1 - Yield$GWAS_pval, df = 1)
+GWAS_Yield_lamda     = round(median(Yield_chisq, na.rm = TRUE)/ qchisq(0.5, df= 1),2)
+print(paste("Inflation value for GWAS, Yield", GWAS_Yield_lamda))
+
+inflation_factors    = rbind(data.frame(trait = "GPD",   genomic_inflation_factor = GWAS_GPD_lamda),
+                             data.frame(trait = "Yield", genomic_inflation_factor = GWAS_Yield_lamda))
+
+#QQ plots 
+n                    = length(unique(GWAS_upd_df$SNP))
+                      
+current_data         = GWAS_upd_df %>% 
+                       dplyr::select(c("SNP", "CHROM", "POS", "GWAS_pval", "trait")) %>% 
+                       pivot_wider(names_from = trait, values_from = GWAS_pval)
+                    
+         CMplot(Pmap = current_data, col = trait_colors, plot.type = c("q"),
+                       threshold = c(0.05/n), threshold.col = c('black'), threshold.lwd = 2, 
+                       points.alpha = 75, signal.cex = 3, multraits = T, multracks = F, amplify = TRUE,
+                       file.output = TRUE, main = , file = "jpg", file.name = "GWAS_plot") 
+                       
+GWAS_QQ_plot         = readJPEG(paste0(current_path, "/Multi-traits_QQplot.GWAS_plot.jpg"))
+GWAS_QQ_plot         = ggplot() + annotation_raster(GWAS_QQ_plot, xmin = -Inf, xmax = Inf, ymin = -Inf, ymax = Inf) + theme_void()
+
+#############################################################
+#Q) Compare SSA and GWAS
+############################################################# 
+
+#SSA table (not anonymized)
+SSA_table            = SSA_output_upd %>% dplyr::filter(FDR <= 0.05) %>%
+                       dplyr::mutate(analysis = "SSA", trait = NA) %>% 
+                       dplyr::select(c("analysis", "trait", "SNP", "CHROM", "POS", "Effect", "SE", "S", "Pval", "FDR")) %>%
+                       left_join(MAF_start_end_df, by = "SNP") 
+                       
+#Annotations (gene)
+snps_gr              = GRanges(seqnames = paste0("Chr", SSA_table$CHROM), 
+                                                  ranges = IRanges(start = SSA_table$POS, end = SSA_table$POS),SNP = SSA_table$SNP)
+idx                  = nearest(snps_gr, genes)
+
+colnames(mcols(genes))
+
+snp_annotation       = data.frame(SNP  = SSA_table$SNP, 
+                                 CHROM = SSA_table$CHROM, 
+                                 POS   = SSA_table$POS, 
+                                 Distance = distance(snps_gr, genes[idx])) %>% bind_cols(as.data.frame(mcols(genes[idx])))
+
+snp_annotation_clean = snp_annotation %>%
+                       dplyr::select(SNP, CHROM, POS, GeneID = ID, PreviousID = previous_id, Confidence = primconf, Distance) %>%
+                       arrange(CHROM, POS)
+
+#Annotations (functional)
+annotations_summary = annotations_func %>%
+                      dplyr::filter(g2.identifier %in% snp_annotation_clean$GeneID) %>%
+                      group_by(g2.identifier) %>%
+                      summarise(Description = paste(unique(f.name[f.type == "Human readable description"]), collapse = "; "),
+                                InterPro = paste(unique(na.omit(f.label[f.type == "InterPro"])), collapse = "; "),.groups = "drop")
+
+snp_annotation_final = snp_annotation_clean %>%
+                       left_join(annotations_summary, by = c("GeneID" = "g2.identifier")) %>%
+                       dplyr::select(SNP, CHROM, POS, GeneID, Description, InterPro,  Confidence, Distance)
+                       
+############################################################# 
+                       
+SSA_table_ext        = SSA_table %>% left_join(key_SNPs, by = "SNP") %>% left_join(snp_annotation_final, by = c("SNP", "CHROM", "POS")) 
+
+SSA_anno_df          = SSA_table_ext %>%
+                      dplyr::mutate(Gene_label = GeneID) %>% dplyr::arrange(S)
+
+max_S                = max(abs(SSA_anno_df$S), na.rm = TRUE)
+
+SSA_anno_plot        = ggplot(SSA_anno_df, aes(x = reorder(SNP_ano, S), y = S, colour = Distance / 1000)) +
+                       geom_hline(yintercept = 0, linetype = 2, colour = "grey50") +
+                       geom_segment(aes(xend = SNP_ano, yend = 0), colour = "grey70") +
+                       geom_point(size = 2) +
+                       geom_text(aes(y = S + ifelse(S > 0, 0.75, -0.75), label = Gene_label, hjust = ifelse(S > 0, 0, 1)), angle = 90, size = 3) +
+                       scale_colour_viridis_c(name = "Distance to gene (kb)") +
+                       labs(x = "SNP", y = "Z-scores (SSA)") + 
+                       coord_cartesian(ylim = c(-(max_S + 20), max_S + 15)) +
+                       theme_bw() +
+                       theme(panel.grid        = element_blank(), 
+                             axis.text.x       = element_text(angle = 90, hjust = 1, vjust = 0.5), 
+                             legend.position   = "inside", legend.position.inside = c(0.02, 0.98), legend.justification = c(0, 1),
+                             legend.direction  = "horizontal", 
+                             legend.title      = element_text(size = 8),
+                             legend.text       = element_text(size = 7),
+                             legend.title.position = "top",
+                             legend.margin = margin(5, 15, 5, 5), 
+                             legend.background = element_rect(fill = scales::alpha("white", 0.8), colour = "black")) +
+                       guides(colour = guide_colourbar(direction = "horizontal", barwidth = 5, barheight = 0.75))
+                 
+#SSA table (anonymized)
+SSA_table_ano_final  = SSA_table_ext %>% 
+                       dplyr::select(c("analysis","SNP_ano","Effect", "SE", "S", "Pval", "FDR", "MAF_start", "MAF_end", "GeneID", "Description")) %>%
+                       arrange(Pval, FDR) %>% dplyr::mutate("Genomic inflation" = SSA_lamda)
+
+############################################################# 
+ 
+#GWAS table 
+GWAS_table           = GWAS_df %>% dplyr::filter(GWAS_FDR <= 0.05) %>%
+                       dplyr::mutate(analysis = "GWAS") %>% 
+                       dplyr::select(c("analysis", "trait", "SNP", "CHROM", "POS", "GWAS_B", "GWAS_SE", "GWAS_pval", "GWAS_FDR")) %>%
+                       dplyr::rename_with(~ gsub("^GWAS_", "", .x)) %>%
+                       dplyr::rename(Effect = B) 
+   
+#GWAS table -Anonymized                    
+GWAS_table_ano       = GWAS_table %>% left_join(key_SNPs, by = "SNP") %>% 
+                       dplyr::select(-c("SNP")) %>%   
+                       dplyr::select(SNP_ano, dplyr::everything()) %>%
+                       dplyr::arrange(as.numeric(sub("SNP_", "", SNP_ano)))
+        
+#Correlation plot
+quantiles            = c(0, seq(0.30, 0.90, by = 0.20), 0.95, 0.99)
+
+thresholds           = SSA_output_upd %>% 
+                       dplyr::mutate(S_abs = abs(S)) %>% pull(S_abs) %>% quantile(probs = quantiles) %>% as.data.frame() %>%
+                       setNames("threshold") %>% rownames_to_column("quantile") %>% dplyr::mutate(thresholds = round(threshold, 4))
+
+GWAS_quantiles       = thresholds %>% rowwise() %>%
+                       do({current_quantile  <- .$quantile
+                           current_threshold <- .$threshold
+                       GWAS_df %>%                          
+                       dplyr::filter(abs(S) >= current_threshold) %>% 
+                       dplyr::mutate(quantile = current_quantile) }) %>% bind_rows() %>%
+                       dplyr::mutate(zscore_GWAS = GWAS_B /GWAS_SE) %>% dplyr::rename(zscore_SSA = S) 
+
+corr_df              = GWAS_quantiles %>%
+                       group_by(quantile, trait) %>%
+                       summarize(r    = cor(zscore_GWAS, zscore_SSA, method = "pearson"), 
+                                 pval = cor.test(zscore_GWAS, zscore_SSA, method = "pearson")$p.value, .groups = "drop") %>%
+                       dplyr::mutate(p_label = case_when(pval < 0.001 ~ "< 0.001", pval < 0.01  ~ "< 0.01", pval < 0.05  ~ "< 0.05", TRUE ~ "ns"),
+                                       label = paste0("r = ", round(r, 2), ", p ", p_label)) %>%
+                       dplyr::mutate(quantile = ifelse(quantile == "0%", "All sites", quantile),
+                                     quantile = factor(quantile, levels = c("All sites","30%","50%","70%","90%","95%","99%")))
+                                                                             
+GWAS_quantiles       = GWAS_quantiles %>%
+                       dplyr::mutate(quantile = ifelse(quantile == "0%", "All sites", quantile),
+                                     quantile = factor(quantile, levels = c("All sites","30%","50%","70%","90%","95%","99%")))
+                      
+cor_plot             = ggplot(GWAS_quantiles, aes(x = zscore_SSA, y = zscore_GWAS, color = trait)) +
+                       geom_point(alpha = 0.7, size = 0.5) +
+                       geom_smooth(method = "lm", color = "red", se = FALSE, linewidth = 0.8) +
+                       geom_text(data = corr_df, aes(x = min(GWAS_quantiles$zscore_SSA, na.rm = TRUE), 
+                                                     y = max(GWAS_quantiles$zscore_GWAS, na.rm = TRUE), label = label),
+                       inherit.aes = FALSE, hjust = 0, vjust = 1, color = "black", size = 2.5) +
+                       facet_grid(trait ~ quantile) +
+                       scale_color_manual(values = trait_colors) +
+                       xlab("Z-scores (SSA)") + ylab("Z-scores (GWAS)") +
+                       theme_bw() +
+                       theme(legend.position = "none", strip.background = element_blank(),
+                             axis.text.x     = element_text(angle = 90, hjust = 1, vjust = 0.5))
+
+#############################################################
+#R) Phenotypes
+#############################################################
+
+#GP
+Phenotypes_GP_df     = data_list[["GP"]] %>% dplyr::mutate(analysis = "GP") %>% 
+                       dplyr::mutate(trait = recode(trait, "Protein" = "GPD", "Plantheight" = "Plant height")) %>%
+                       dplyr::mutate(trait = factor(trait, levels = c("Heading date", "Plant height", "GPD", "Yield")),
+                                     analysis = "GP")
+
+Phenotypes_GPA_plot  = ggplot(Phenotypes_GP_df %>% filter(trait %in% c("Heading date", "Plant height")), aes(x = effect)) +
+                       geom_histogram(bins = 50, fill = "lightgrey", color = "black", alpha = 0.6) +
+                       facet_grid(analysis ~ trait, scales = "free_x") +
+                       theme_bw() + labs(y = "Frequency", x = "") +
+                       theme(axis.text.x = element_text(angle = 45, hjust = 1),
+                             strip.text  = element_text(size = 14))
+                       
+Phenotypes_GPB_plot  = ggplot(Phenotypes_GP_df %>% filter(trait %in% c("GPD", "Yield")), aes(x = effect)) +
+                       geom_histogram(bins = 50, fill = "lightgrey", color = "black", alpha = 0.6) +
+                       facet_grid(analysis ~ trait, scales = "free_x") +
+                       theme_bw() + labs(y = "Frequency", x = "") +
+                       theme(axis.text.x = element_text(angle = 45, hjust = 1),
+                             strip.text  = element_text(size = 14))
+                       
+#GWAS                       
+Phenotypes_GWAS_df   = data_list[["GWAS"]] %>% dplyr::mutate(analysis = "GP") %>% 
+                       dplyr::mutate(trait = recode(trait, "Protein" = "GPD")) %>%
+                       dplyr::mutate(trait = factor(trait, levels = c("GPD", "Yield")),
+                                     analysis = "GWAS")
+
+Phenotypes_GWAS_plot = ggplot(Phenotypes_GWAS_df, aes(x = effect)) +
+                       geom_histogram(bins = 50, fill = "lightgrey", color = "black", alpha = 0.6) +
+                       facet_grid(analysis ~ trait, scales = "free_x") +
+                       theme_bw() + labs(y = "Frequency", x = "") +
+                       theme(axis.text.x = element_text(angle = 45, hjust = 1),
+                             strip.text = element_text(size = 14))                       
+ 
+#Table                 
+prepared_data_GP     = data_list[["GP"]]
+prepared_data_GWAS   = data_list[["GWAS"]]    
+                                     
+GP_total             = prepared_data_GP %>% group_by(trait) %>% summarise(lines_total = n_distinct(id))                               
+GWAS_total           = prepared_data_GWAS %>% group_by(trait) %>% summarise(lines_total = n_distinct(id))
+
+GP_pr_year           = prepared_data_GP %>% group_by(trait, year, country, region) %>% 
+                       summarise(lines_pr_year = n_distinct(id)) %>% left_join(GP_total, by = "trait") %>% dplyr::mutate(analysis = "GP") %>% 
+                       pivot_wider(names_from = year, values_from = "lines_pr_year", names_prefix = "year_")
+
+GWAS_pr_year         = prepared_data_GWAS %>% group_by(trait, year, country, region) %>% 
+                       summarise(lines_pr_year = n_distinct(id)) %>% left_join(GWAS_total, by = "trait") %>% dplyr::mutate(analysis = "GWAS") %>% 
+                       pivot_wider(names_from = year, values_from = "lines_pr_year", names_prefix = "year_")
+
+phenotypes_table     = rbind(GWAS_pr_year, GP_pr_year) 
+ 
+#############################################################
+#S) Kernel correlation
+############################################################# 
+
+thresholds           = thresholds %>% dplyr::filter(quantile != "0%")
+                            
+X_center             = scale(geno_GP, center = TRUE, scale = FALSE)
+p                    = colMeans(geno_GP) / 2
+sum_2pq              = sum(2 * p * (1 - p)) 
+S                    = sum_2pq      
+
+check_list           = lapply(thresholds$quantile, function(current_threshold) {
+
+            GRM_list = readRDS(paste0(path_input, "kinships/GRMs_unpermuted_", current_threshold, ".rds"))[["notperm_0"]]
+
+             scaling = bind_rows(GRM_list$scaling) %>% 
+                       dplyr::select(-c(permute, permutation, threshold)) %>% 
+                       bind_rows(tibble(GRM = "Base", scaling = S, quantile = current_threshold, no_snps = ncol(geno)))
+
+            scalings = scaling %>% column_to_rownames("GRM")
+
+               GRM_S = GRM_list$kinships$Sel
+               GRM_N = GRM_list$kinships$Neu
+
+               delta = (scalings["Sel","scaling"]/S * GRM_S + scalings["Neu","scaling"]/S * GRM_N) - GRM_G
+
+               list(check = data.frame(threshold = current_threshold, relative_error = norm(delta, "F") / norm(GRM_G, "F"),
+                                       offdiag_cor = cor(GRM_S[upper.tri(GRM_S)], GRM_N[upper.tri(GRM_N)])),
+                    snps  = scaling)})
+
+kernel_info          = list(kernel_cor = bind_rows(lapply(check_list, `[[`, "check")),
+                            snps_no = bind_rows(lapply(check_list, `[[`, "snps")))
+                            
+saveRDS(kernel_info, paste0(path_input, "kinships/kernel_info_list.rds"))
+        
+#############################################################
+#T) Kernel correlation plot
+############################################################# 
+
+component_colors     = c(G = "#440154", GS = "#482878", GN = "#3E4989", GxC = "#31688E", GSxC = "#26828E", GNxC = "#35B779", E = "#FDE725")
+
+kernel_cor_df        = kernel_info[["kernel_cor"]]
+
+kernel_snps_df       = kernel_info[["snps_no"]] %>%
+                       dplyr::mutate(GRM = recode(GRM, "Neu" = "GN", "Sel" = "GS"),
+                                     quantile = factor(quantile, levels = c("30%", "50%", "70%", "90%", "95%", "99%"))) %>%
+                       group_by(quantile) %>%
+                       dplyr::mutate(proportion = no_snps / no_snps[GRM == "Base"]) %>% ungroup() %>%
+                       dplyr::filter(GRM != "Base")
+
+kernel_cor_plot      = ggplot(kernel_cor_df, aes(x = threshold, y = offdiag_cor)) +
+                       geom_line(linewidth = 0.8) +
+                       geom_point(size = 3) +
+                       geom_line(linewidth = 0.8, color = viridisLite::viridis(1)[1]) +
+                       theme_bw() +
+                       labs(x = "Minimum score percentile", y = "Off-diag. correlation") + ylim(0,1)
+                       
+kernel_snps_plot     = kernel_snps_df %>%
+                       ggplot(aes(x = quantile, y = proportion, fill = GRM)) +
+                       geom_col(position = position_dodge(width = 0.8), width = 0.7, color = "black", linewidth = 0.2) +
+                       geom_text(aes(label = scales::comma(no_snps), y = proportion + 0.095),
+                                     position = position_dodge(width = 0.8), angle = 90, vjust = 0.5, size = 3) +
+                       scale_fill_manual(values = component_colors[c("GS", "GN")]) +
+                       scale_y_continuous(labels = scales::percent, expand = expansion(mult = c(0, 0.12))) +
+                       labs(x = "Minimum score percentile", y = "Proportion of SNPs", fill = "GRM") +
+                       theme_bw() +
+                       theme(panel.grid          = element_blank(),
+                            legend.position      = c(0.02, 0.98),
+                            legend.justification = c("left", "top"),
+                            legend.background    = element_rect(fill = "white", color = "black", linewidth = 0.3),
+                            legend.title         = element_text(size = 8),
+                            legend.text          = element_text(size = 7),
+                            legend.key.size      = unit(0.5, "cm"),
+                            legend.spacing.y     = unit(0.1, "cm"),
+                            legend.margin        = margin(2, 2, 2, 2),
+                            legend.direction     = "horizontal")
+                        
+#############################################################
+#U) Variance Inflation analysis
+#############################################################
+
+PCs                  = prcomp(geno_GP, center = T, scale = F)$x %>% as.data.frame() %>%                     
+                       dplyr::select(c("PC1", "PC2", "PC3")) %>% rownames_to_column("id")  
+
+loads_upd            = loads %>% left_join(PCs, by = "id")
+ 
+VIF_PCA_df           = data.frame()
+
+for(current_interval in unique(loads_upd$quantile)) {
+
+loads_sub            = loads_upd %>% dplyr::filter(quantile == current_interval) 
+
+dummy_y              = rnorm(nrow(loads_sub)) 
+
+model                = lm(dummy_y ~ G + B + D + PC1 + PC2 + PC3, data = loads_sub) 
+
+temp                 = car::vif(model) %>% as.data.frame() %>%
+                       dplyr::mutate("quantile" = current_interval) %>%
+                       rownames_to_column("covariate") %>% 
+                       dplyr::rename("VIF" = ".")
+                          
+VIF_PCA_df           = rbind(temp, VIF_PCA_df) }
+
+cols                 = c("D"   = viridis(2, option = "D")[1],
+                         "B"   = viridis(2, option = "D")[2],
+                         "G"   = "grey",
+                         "PC1" = "grey",
+                         "PC2" = "grey",
+                         "PC3" = "grey")
+
+VIF_plot             = ggplot(VIF_PCA_df, aes(x = covariate, y = VIF, fill = covariate)) +
+                       geom_col() +
+                       scale_fill_manual(values = cols) +
+                       labs(x = "Covariates", y = "Variance inflation factor") +
+                       theme_bw() +
+                       theme(legend.position = "none",
+                             axis.text.x = element_text(angle = 45, hjust = 1)) +
+                       geom_hline(yintercept = 5, linetype = "dashed", color = "grey") +
+                       geom_hline(yintercept = 10, linetype = "dashed", color = "red") +
+                       facet_wrap(~ quantile, nrow = 2, ncol = 3, scales = "free_x")       
+
+#############################################################
+#V) PCA plots and scree plots (SSA, GWAS and GP)
+############################################################# 
+
+#Geno inputs
+geno_SSA              = SSA_input
+geno_GWAS             = geno[samples_GWAS, ]                    
+geno_GP               = geno[samples_GP, ]
+
+#Function 
+prepare_PCA_and_scree = function(geno_input, analysis_name) {
+  
+ PCA = prcomp(geno_input, center = TRUE, scale. = FALSE)
+  
+ PCs = PCA$x %>%  as.data.frame() %>% dplyr::select(PC1, PC2, PC3) %>% tibble::rownames_to_column("id") %>% dplyr::mutate(analysis = analysis_name)
+   
+ variance_explained = PCA$sdev^2 / sum(PCA$sdev^2) * 100
+ 
+ scree_df    = data.frame(PC = seq_along(PCA$sdev), eigenvalue = PCA$sdev^2)
+  
+ PCA_plot    = PCs %>% ggplot(aes(x = PC1, y = PC2)) + 
+               geom_point(shape = 21, size = 2, alpha = 0.8, stroke = 0.1, fill = analysis_colors[analysis_name], color = "black") +
+               labs(x = sprintf("PC1 (%.2f%%)", variance_explained[1]), y = sprintf("PC2 (%.2f%%)", variance_explained[2])) +
+               theme_bw() +
+               theme(legend.position = "none", panel.border = element_rect(color = "black", fill = NA, linewidth = 0.6)) +
+               facet_grid(~ analysis)
+  
+  scree_plot = ggplot(scree_df %>% dplyr::filter(PC <= 10), aes(x = PC, y = eigenvalue)) +
+               geom_line(color  = "black", linewidth = 0.8) +
+               geom_point(color = "black", size = 1.5) +
+               scale_x_continuous(breaks = 1:10) +
+               labs(x = "Component number", y = "Eigenvalue") +
+               theme_bw() +
+               theme(axis.text.x  = element_text(size = 7), 
+                     axis.text.y  = element_text(size = 7),
+                     axis.title.y = element_text(size = 8),
+                     panel.grid   = element_blank(),
+                     plot.margin  = margin(2, 2, 2, 2),
+                     panel.background = element_rect(fill = "transparent", color = NA),
+                     plot.background = element_rect(fill = "transparent",color = NA))
+               
+  combined_plot = scree_plot / PCA_plot + patchwork::plot_layout(heights = c(1.25, 4))
+  
+  return(combined_plot) }
+  
+  #Run function
+  PCA_SSA  = prepare_PCA_and_scree(geno_SSA,  "SSA")
+  PCA_GWAS = prepare_PCA_and_scree(geno_GWAS, "GWAS")
+  PCA_GP   = prepare_PCA_and_scree(geno_GP,   "GP")
+
+  PCA_all  = PCA_SSA | PCA_GWAS | PCA_GP + patchwork::plot_annotation(tag_levels = "A")
+
+#############################################################
+#W) Imputation check and updated table for samples pr. dataset/year
+############################################################# 
+
+dosage_correlation   = cor(imputation_check$original, imputation_check$imputed)
+
+dosage_r2            = dosage_correlation^2
+
+genotype_concordance = mean(imputation_check$original == imputation_check$imputed)
+
+imputation_summary   = data.frame(Metric = c("Dosage correlation", "Dosage R≤", "Genotype concordance"),
+                                  Value  = c(round(dosage_correlation,2), round(dosage_r2,2), round(genotype_concordance,2)))
+                                                                        
+#############################################################
+#X) Figures 
+############################################################# 
+
+### For reviewer
+#R1) MAF plot
+R1       = MAF_plot
+ggsave(paste0(path_figures, "R1.png"), plot = R1, width = 8, height = 6, dpi = 500)
+
+#R2) PCA plots for the different datasets
+R2       = PCA_all
+ggsave(paste0(path_figures, "R2.png"), plot = R2, width = 12, height = 4, dpi = 500)
+
+### Intermediate plots
+#F6
+F6AB     = ggarrange(SSA_manhattan_plot_v1, SSA_QQ_plot, labels = c("A", "B"), ncol = 2, nrow = 1, widths = c(10, 2.5))  
+F6C      = ggarrange(SSA_anno_plot, labels = c("C"), ncol = 1, nrow = 1)
+F6       = ggarrange(F6AB, F6C, nrow = 2, heights = c(1, 2))
+
+#F7
+F7AB     = ggarrange(GWAS_manhattan_plot, GWAS_QQ_plot, labels = c("A", "B"), ncol = 2, nrow = 1, widths = c(10, 2.5))  
+F7C      = ggarrange(cor_plot, labels = c("C"), ncol = 1, nrow = 1)
+F7       = ggarrange(F7AB, F7C, nrow = 2, heights = c(1, 2))
+
+#S1
+S1A      = ggpubr::ggarrange(Phenotypes_GPA_plot, Phenotypes_GPB_plot, Phenotypes_GWAS_plot, ncol = 1, nrow = 3, heights = c(1, 1, 1), labels = "A")
+S1BCD    = ggarrange(LD_decay_v1_plot, kernel_cor_plot, kernel_snps_plot, labels = c("B", "C", "D"), ncol = 3, nrow = 1)
+S1E      = ggarrange(VIF_plot, labels = c("E"), ncol = 1, nrow = 1) 
+S1       = ggarrange(S1A, S1BCD, S1E, ncol = 1, nrow = 3, heights = c( 3, 1.5, 2))  
+
+### Manuscript
+#F1) Time line
+
+#F2) PCA plot
+F2     = PCA_cluster_LD_plot
+ggsave(paste0(path_figures, "F2.png"), plot = F2, device = ragg::agg_png, width = 7, height = 4.5, units = "in", dpi = 500)
+
+#F6) SSA: Manhattan plot, QQplot and annotation plot
+F6     = F6
+ggsave(paste0(path_figures, "F6.png"), plot = F6, width = 28, height = 21, unit = "cm", dpi = 500)
+
+#F7) GWAS: Manhattan plot, QQplot and correlation plot
+F7     = F7
+ggsave(paste0(path_figures, "F7.png"), plot = F7, width = 28, height = 18, unit = "cm", dpi = 500)
+
+#Supplementary
+#S1)
+S1     = S1
+ggsave(paste0(path_figures, "S1.png"), plot = S1, width = 10, height = 12, dpi = 500)  
+          
+#############################################################
+#Y) Tables (main or supplementary)
+############################################################# 
+
+write_xlsx(SSA_table_ano_final, paste0(path_tables,"TS4_SSA_anonymized.xlsx")) 
+
+############################################################# 
+
+write_xlsx(imputation_summary, paste0(path_tables,"not_manuscript/T0A_imputation_table.xlsx")) 
+write_xlsx(LDblocks,           paste0(path_tables,"not_manuscript/T0B_LDblocks_table.xlsx"))
+write_xlsx(SSA_crossing_table, paste0(path_tables,"not_manuscript/T0C_SSA_sample_no_table.xlsx")) 
+write_xlsx(SSA_table_prop,     paste0(path_tables,"not_manuscript/T0D_SSA_prop_table.xlsx"))
+write_xlsx(inflation_factors,  paste0(path_tables,"not_manuscript/T0E_inflation_factors_GWAS.xlsx"))
+write_xlsx(phenotypes_table,   paste0(path_tables,"not_manuscript/T0F_phenotypes_table.xlsx")) 
+                                                                                                          
+#############################################################
