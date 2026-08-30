@@ -5,36 +5,34 @@ library(tibble)
 library(tidyr)
 library(MM4LMM)
 library(qgg)
+library(sommer)
 #############################################################
 #A) Paths
 ############################################################# 
 
-submission      = "submission1"
-
 path            = "/home/tasha/breedfuture/"
-path_input      = paste0(path, "prepared_data/v2/")
-path_output     = paste0(path, "results/v2/model_output/variance_partition/")
-path_kinships   = paste0(path, "results/v2/kinships/")
+path_input      = paste0(path, "prepared_data/submission2/")
+path_output     = paste0(path, "output/submission2/")
 
 #############################################################
 #B) Inputs
 ############################################################# 
 
+cores           = 30
+
 quantiles       = c(paste0(seq(30, 90, by = 20), "%"), "95%", "99%")
 
 X_input         = as.formula('effect ~ 1 + G + country + G:country')
 
-############################################################# 
+GRM_G           = readRDS(paste0(path_input, "kinships/GRM_baseline.rds"))
+GRM_G_upd       = as.matrix(Matrix::nearPD(GRM_G)$mat)
 
-GRM_G           = readRDS(paste0(path_kinships, "random_effects/GRM_baseline_v2.rds"))
+E_kernels       = readRDS(paste0(path_input, "kinships/ENV_kernels.rds"))
 
-E_kernels       = readRDS(paste0(path_input, "environment_kernels.rds"))
-
-data_list       = readRDS(paste0(path_input, "phenotypes.rds")) %>% 
-                  dplyr::filter(analysis == "GP") %>% 
+data_list       = readRDS(paste0(path_input, "phenotypes/phenotypes_df.rds")) %>% dplyr::filter(analysis == "GP") %>% 
                   dplyr::mutate_at(vars("id", "year", "region", "country"), as.character) %>% split(.$trait)
 
-loads           = readRDS(paste0(path_kinships, "fixed_effects/loads_unpermuted_v2.rds")) %>% distinct(id, G)
+loads           = readRDS(paste0(path_input, "loads/loads_unpermuted.rds")) %>% distinct(id, G)
 
 ############################################################# 
 #C) Variance partition- single GRM (unpermuted)
@@ -57,7 +55,7 @@ loads           = readRDS(paste0(path_kinships, "fixed_effects/loads_unpermuted_
    KR           = E_kernels[["KR"]][data_subset$region, data_subset$region]
    KY           = E_kernels[["KY"]][data_subset$year, data_subset$year]   
    
-   GRM_G_ext    = GRM_G[data_subset$id, data_subset$id]
+   GRM_G_ext    = GRM_G_upd[data_subset$id, data_subset$id]
    
    V_M1_list    = list("G" = GRM_G_ext, "GxC" = GRM_G_ext * KC, "CxY" = KC * KY)
 
@@ -83,9 +81,9 @@ loads           = readRDS(paste0(path_kinships, "fixed_effects/loads_unpermuted_
    
    saveRDS(SK_var, paste0(path_output, "SK_variance_components_unpermuted.rds")) 
    saveRDS(SK_llr, paste0(path_output, "SK_likelihoods_unpermuted.rds")) 
-   
+      
 ############################################################# 
-#D) Variance partition-multiple GRM (unpermuted)
+#D) Variance partition-multi GRM (unpermuted)
 ############################################################# 
    
    MK_var        = data.frame()
@@ -94,7 +92,7 @@ loads           = readRDS(paste0(path_kinships, "fixed_effects/loads_unpermuted_
    for(current_quantile in quantiles){
    print(paste0("quantile is ", current_quantile))
 
-   G_kernels     = readRDS(paste0(path_kinships, "random_effects/GRMs_unpermuted_", current_quantile,"_v2.rds"))[[1]][["kinships"]]
+   G_kernels     = readRDS(paste0(path_input, "kinships/GRMs_unpermuted_", current_quantile,".rds"))[[1]][["kinships"]]
     GRM_S        = G_kernels[["Sel"]]
     GRM_N        = G_kernels[["Neu"]]
    
@@ -131,7 +129,7 @@ loads           = readRDS(paste0(path_kinships, "fixed_effects/loads_unpermuted_
 
    results       = lapply(names(models_list), function(model_name) {
   
-   MK_model      = greml(y = y, X = X_form, GRM = models_list[[model_name]], ncores = 25)
+   MK_model      = greml(y = y, X = X_form, GRM = models_list[[model_name]], ncores = cores)
                    
    MK_var_temp   = MK_model$theta %>% as.data.frame() %>% 
                    rownames_to_column("Component") %>% 
@@ -156,7 +154,7 @@ loads           = readRDS(paste0(path_kinships, "fixed_effects/loads_unpermuted_
    saveRDS(MK_var, paste0(path_output, "MK_variance_components_unpermuted.rds")) 
  
 ############################################################# 
-#E) Variance partition (permuted)
+#E) Variance partition- multi GRM (permuted)
 ############################################################# 
    
    MK_var        = data.frame()
@@ -165,7 +163,7 @@ loads           = readRDS(paste0(path_kinships, "fixed_effects/loads_unpermuted_
    for(current_quantile in quantiles){
    print(paste("quantile is ", current_quantile))
 
-   G_kernels     = readRDS(paste0(path_kinships, "random_effects/GRMs_permuted_", current_quantile,"_v2.rds"))
+   G_kernels     = readRDS(paste0(path_input, "kinships/GRMs_permuted_", current_quantile,".rds"))
    
    for(current_trait in names(data_list)) {
           
@@ -204,7 +202,7 @@ loads           = readRDS(paste0(path_kinships, "fixed_effects/loads_unpermuted_
 
    results       = lapply(names(models_list), function(model_name) {
   
-   MK_model      = greml(y = y, X = X_form, GRM = models_list[[model_name]], ncores = 25)
+   MK_model      = greml(y = y, X = X_form, GRM = models_list[[model_name]], ncores = cores)
                    
    MK_var_temp   = MK_model$theta %>% as.data.frame() %>% 
                    rownames_to_column("Component") %>% 
@@ -215,16 +213,62 @@ loads           = readRDS(paste0(path_kinships, "fixed_effects/loads_unpermuted_
                    dplyr::rename("llik" = ".") %>%  
                    dplyr::mutate("random_model" = model_name) 
   
-   list("llrt" = MK_llr_temp, "var" = MK_var_temp) })
+     list("llrt" = MK_llr_temp, "var" = MK_var_temp) })
 
-   MK_llr        = rbind(MK_llr, do.call(rbind, lapply(results, `[[`, "llrt")) %>% mutate(!!!meta))
+   MK_llr        = rbind(MK_llr, do.call(rbind, lapply(results, `[[`, "llrt")) %>% dplyr::mutate(!!!meta))
       
-   MK_var        = rbind(MK_var, do.call(rbind, lapply(results, `[[`, "var")) %>% mutate(!!!meta)) }, 
+   MK_var        = rbind(MK_var, do.call(rbind, lapply(results, `[[`, "var")) %>% dplyr::mutate(!!!meta)) }, 
                    
    error = function(e) { cat("Error for trait", current_trait, ":", e$message, "\n") }) }}}
 
    saveRDS(MK_llr, paste0(path_output, "MK_likelihoods_permuted.rds"))
    saveRDS(MK_var, paste0(path_output, "MK_variance_components_permuted.rds"))
     
+#############################################################
+#F)  Reliability of predicted genetic effects
+#############################################################
+
+reliability_df  = data.frame()
+
+for(current_trait in names(data_list)) {
+   
+   data_subset  = data_list[[current_trait]] %>% left_join(loads, by = "id") %>% 
+                  dplyr::mutate(id_country     = paste(.$id, .$country, sep = ":"),
+                                country_year   = paste(.$country, .$year, sep = ":"),
+                                country_region = paste(.$country, .$region, sep = ":")) 
+
+   GRM_G_ext    = GRM_G_upd[as.character(data_subset$id), as.character(data_subset$id)]
+  
+   GxKC         = kronecker(GRM_G_upd, E_kernels[["KC"]], make.dimnames = T)[data_subset$id_country, data_subset$id_country]
+   CxY          = kronecker(E_kernels[["KC"]], E_kernels[["KY"]], make.dimnames = T)[data_subset$country_year, data_subset$country_year]
+   CxR          = kronecker(E_kernels[["KC"]], E_kernels[["KR"]], make.dimnames = T)[data_subset$country_region, data_subset$country_region]
+
+     if (length(unique(data_subset$region)) > 2) {
+   
+    fit         = sommer::mmer(fixed  = effect ~ 1 + G + country + G:country,
+                               random = ~ vsr(id, Gu = GRM_G_ext) + vsr(id_country, Gu = GxKC) + 
+                                          vsr(country_year, Gu = CxY) +vsr(country_region, Gu = CxR),
+                               rcov   = ~ units,
+                               data   = data_subset,
+                               getPEV = TRUE,
+                               dateWarning = FALSE) 
+                                
+                                                   } else {
+    
+  fit           = sommer::mmer(fixed  = effect ~ 1 + G + country + G:country,
+                               random = ~ vsr(id, Gu = GRM_G_ext) + vsr(id_country, Gu = GxKC) + vsr(country_year, Gu = CxY),
+                               rcov   = ~ units,
+                               data   = data_subset,
+                               getPEV = TRUE,
+                               dateWarning = FALSE)  }
+                                
+  PEV_u_diag     = diag(fit$PevU$`u:id`$effect)
+
+  temp_output    = data.frame("trait" = current_trait, "R" = 1 - mean(PEV_u_diag, na.rm = TRUE) / fit$sigma$`u:id`[1, 1])
+  
+  reliability_df = rbind(temp_output, reliability_df) }
+
+   saveRDS(reliability_df, paste0(path_output, "SK_reliability_unpermuted.rds"))
+
 #############################################################
 #############################################################
