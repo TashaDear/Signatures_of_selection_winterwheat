@@ -10,30 +10,26 @@ library("purrr")
 #Paths 
 #############################################################
 
-submission      = "submission1"
-
-path            = "/home/tasha/breedfuture/"
-path_input      = paste0(path, "prepared_data/v2/")
-path_output     = paste0(path, "results/v2/model_output/validation/")
-path_kinships   = paste0(path, "results/v2/kinships/")
+path              = "/home/tasha/breedfuture/"
+path_input        = paste0(path, "prepared_data/submission2/")
+path_output       = paste0(path, "output/submission2/")
 
 #############################################################
 #B) Inputs
 ############################################################# 
 
-quantiles          = c(paste0(seq(30, 90, by = 20), "%"), "95%", "99%")
+quantiles       = c(paste0(seq(30, 90, by = 20), "%"), "95%", "99%")
 
-GRM_G              = readRDS(paste0(path_kinships, "random_effects/GRM_baseline_v2.rds"))
-GRM_G_upd          = as.matrix(Matrix::nearPD(GRM_G)$mat)
+GRM_G           = readRDS(paste0(path_input, "kinships/GRM_baseline.rds"))
+GRM_G_upd       = as.matrix(Matrix::nearPD(GRM_G)$mat)
 
-E_kernels          = readRDS(paste0(path_input, "environment_kernels.rds"))
+E_kernels       = readRDS(paste0(path_input, "kinships/ENV_kernels.rds"))
 
-data_list          = readRDS(paste0(path_input, "phenotypes.rds")) %>% 
-                     dplyr::filter(analysis == "GP") %>% 
-                     dplyr::mutate_at(vars("id", "year", "region", "country"), as.character) %>% split(.$trait)
+data_list       = readRDS(paste0(path_input, "phenotypes/phenotypes_df.rds")) %>% dplyr::filter(analysis == "GP") %>% 
+                  dplyr::mutate_at(vars("id", "year", "region", "country"), as.character) %>% split(.$trait)
 
-loads_unpermuted   = readRDS(paste0(path_kinships, "fixed_effects/loads_unpermuted_v2.rds")) 
-loads_permuted     = readRDS(paste0(path_kinships, "fixed_effects/loads_permuted_v2.rds")) 
+loads_unpermuted= readRDS(paste0(path_input, "loads/loads_unpermuted.rds"))
+loads_permuted  = readRDS(paste0(path_input, "loads/loads_permuted.rds")) 
 
 #############################################################
 #B) Helper function 
@@ -79,15 +75,13 @@ return(temp_output) }
 #############################################################
 #C) Validation (unpermuted)
 #############################################################      
-
-validation_unperm   = function() {                  
-  
+           
   final_output      = data.frame()
 
 for(current_quantile in quantiles) {
-print(paste("quantile is ", current_quantile))
+print(paste("--- Quantile is ", current_quantile))
     
-  G_kernels         = readRDS(paste0(path_kinships, "random_effects/GRMs_unpermuted_", current_quantile,"_v2.rds"))[["notperm_0"]][["kinships"]] 
+  G_kernels         = readRDS(paste0(path_input, "kinships/GRMs_unpermuted_", current_quantile,".rds"))[["notperm_0"]][["kinships"]] 
     GRM_S           = as.matrix(Matrix::nearPD(G_kernels[["Sel"]])$mat) 
     GRM_N           = as.matrix(Matrix::nearPD(G_kernels[["Neu"]])$mat) 
   
@@ -130,78 +124,7 @@ print(paste("quantile is ", current_quantile))
       
       final_output  = rbind(final_output, temp_output) }}
       
-saveRDS(final_output, paste0(path_output, "validation_genetic_cluster_unpermuted.rds")) }
-
-#############################################################
-#Run
-validation_unperm()
-
-#############################################################
-#C) Validation (permuted)
-#############################################################  
-
-validation_perm    = function() {
-
- final_output      = data.frame()
-
-for(current_quantile in quantiles) {
-print(paste("quantile is ", current_quantile))
-    
-  G_kernels         = readRDS(paste0(path_kinships, "random_effects/GRMs_permuted_", current_quantile,"_v2.rds")) 
-  
-  loads_sub         = loads_permuted %>% dplyr::filter(quantile == current_quantile)
-  
-     for(current_trait in names(data_list)) {
-     print(current_trait)
-  
-  data_subset       = data_list[[current_trait]] %>% 
-                      dplyr::mutate(genetic_cluster = as.factor(paste0("cluster_", cluster)))
-                  
-  validate_list     = split(seq_len(nrow(data_subset)), data_subset$genetic_cluster) 
-      
-    KC              = E_kernels[["KC"]][data_subset$country, data_subset$country]
-    KR              = E_kernels[["KR"]][data_subset$region, data_subset$region]
-    KY              = E_kernels[["KY"]][data_subset$year, data_subset$year] 
-    
-    GRM_G_ext       = GRM_G_upd[data_subset$id, data_subset$id]
-    
-    V_M1_list       = list("G"  = GRM_G_ext, "GxC"= GRM_G_ext * KC, "CxY" = KC * KY)    
-    
-    for(current_permute in unique(loads_perm$permutation)) {
-    
-    loads_final     = loads_sub %>% dplyr::filter(permutation == current_permute)
-    
-    GRM_S_ext       = G_kernels[[current_permute]][["kinships"]][["Sel"]][data_subset$id, data_subset$id]
-    GRM_N_ext       = G_kernels[[current_permute]][["kinships"]][["Neu"]][data_subset$id, data_subset$id]
-                               
-    V_M2_list       = list("GN" = GRM_N_ext, "GS" = GRM_S_ext, "GxC" = GRM_G_ext * KC, "CxY" = KC * KY)
-    V_M3_list       = list("GN" = GRM_N_ext, "GS" = GRM_S_ext, "GNxC"= GRM_N_ext * KC, "GSxC" = GRM_S_ext * KC, "CxY" = KC * KY)
-    
-    if(length(unique(data_subset$region)) > 2) {
-   
-      V_M1_list[["CxR"]]= KC * KR
-      V_M2_list[["CxR"]]= KC * KR
-      V_M3_list[["CxR"]]= KC * KR }
-  
-      V_list        = list("M1" = V_M1_list, "M2" = V_M2_list, "M3" = V_M3_list)
-      
-      data_final    = data_subset %>% 
-                      dplyr::mutate(.row_order = row_number()) %>% left_join(loads_final, by = "id") %>% arrange(.row_order) 
-                                               
-      out           = pmap_dfr(model_grid, function(fixed_model, random_model) {
-                      run_prediction("data_input" = data_final, "fixed_model" = fixed_model, "random_model" = random_model, 
-                                     "V_input" = V_list, "validate_input" = validate_list)})
-
-      temp_output   = out %>% 
-                      dplyr::mutate("trait" = current_trait, "quantile" = current_quantile, "permuted" = "yes", "permutation" = current_permute)
-      
-      final_output  = rbind(final_output, temp_output) }}
-      
-saveRDS(final_output, paste0(path_output, "validation_genetic_cluster_permuted.rds")) }
-
-#############################################################
-#Run
-validation_perm()
+saveRDS(final_output, paste0(path_output, "validation_genetic_cluster_unpermuted.rds")) 
 
 #############################################################
 #############################################################
