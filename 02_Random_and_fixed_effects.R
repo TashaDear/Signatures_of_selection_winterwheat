@@ -15,21 +15,33 @@ registerDoParallel(cl)
 #A) Paths 
 #############################################################
 
-path              = "/faststorage/project/breedfuture/results/v2/"
-path_input        = paste0(path, "fitness_estimates/")
-path_output       = paste0(path, "kinships/")
+path              = "/faststorage/project/breedfuture/prepared_data/submission2/"
+path_raw          = "/faststorage/project/breedfuture/raw_data/WW/geno/plink/all_data/"
+
+#Output
+path_random       = paste0(path, "kinships/")
+path_fixed        = paste0(path, "loads/")
 
 #############################################################
 #B) Load input
 #############################################################
 
-geno_input        = readRDS(paste0(path_input, "geno.rds")) 
+SNPs_exclude      = readLines(paste0(path_raw, "missing_SNPs_final.txt"))
 
-SSA_output        = readRDS(paste0(path_input, "SSA_output.rds"))
+SSA_output        = readRDS(paste0(path, "SSA/SSA_output_GMMAT_threshold_50_final.rds")) %>% 
+                    dplyr::filter(converged == TRUE, !SNP %in% SNPs_exclude) 
+                    
+phenotypes_df     = readRDS(paste0(path, "phenotypes/prepared_data_list.rds"))[["GP"]] 
 
-data_list         = readRDS(paste0(path_pheno, "phenotypes.rds")) 
+samples_GP        = phenotypes_df %>% pull(id) %>% unique()                    
+                    
+geno_input        = readRDS(paste0(path, "genotypes/geno_with_IDs_validation.rds"))[samples_GP, SSA_output$SNP] %>% as.matrix()
 
-permutations      = 1:250
+print(paste("SNPs in SSA output", nrow(SSA_output), "and SNPs in geno input", ncol(geno_input)))
+stopifnot(all(SSA_output$SNP %in% colnames(geno_input)))
+print(paste("Number of samples in geno input", nrow(geno_input)))
+
+perms             = 1:500
 
 quantiles         = c(seq(0.30, 0.90, by = 0.20), 0.95, 0.99)
 
@@ -37,20 +49,35 @@ thresholds        = SSA_output %>%
                     dplyr::mutate(S_abs = abs(S)) %>% pull(S_abs) %>% 
                     quantile(probs = quantiles) %>% as.data.frame() %>% 
                     setNames("threshold") %>% rownames_to_column("quantile")
+                    
+#############################################################
+#Check
+#############################################################
+
+SNPs_in_SSA       = readRDS(paste0(path, "SSA/SSA_output_GMMAT_threshold_50_final.rds")) %>%  
+                    dplyr::filter(!SNP %in% SNPs_exclude) %>% pull(SNP) %>% length()
+                    
+SNPs_no_converge  = readRDS(paste0(path, "SSA/SSA_output_GMMAT_threshold_50_final.rds")) %>%  
+                    dplyr::filter(converged != "TRUE", !SNP %in% SNPs_exclude) %>% pull(SNP) %>% length()
+                    
+final_SNPs        = readRDS(paste0(path, "SSA/SSA_output_GMMAT_threshold_50_final.rds")) %>%  
+                    dplyr::filter(converged == TRUE, !SNP %in% SNPs_exclude) %>% pull(SNP) %>% length()
+                    
+print(paste("SNPs in SSA", SNPs_in_SSA, ", SNPs which do not converge", SNPs_no_converge, ", SNPs final", final_SNPs))
 
 #############################################################
 #C) Function (Mean partition/Fixed effects)
 #############################################################
 
 Prepare_loads     = function(input, geno, permute, seeds, thresholds_vec){ 
-  print(permute)
+                    print(permute)
               
   loads_df        = data.frame()
              
-  load_MA         = rowSums(geno) %>% as.data.frame() %>% rownames_to_column("id") %>% rename("G" = ".") 
+  load_G          = rowSums(geno) %>% as.data.frame() %>% rownames_to_column("id") %>% rename("G" = ".") 
                                                                    
   for(current_quantile in unique(thresholds_vec$quantile)){
-  print(paste("threshold", current_quantile))
+  print(paste("--- threshold", current_quantile))
   
   current_threshold     = thresholds_vec %>% dplyr::filter(quantile == current_quantile) %>% pull(threshold)
   
@@ -64,25 +91,34 @@ Prepare_loads     = function(input, geno, permute, seeds, thresholds_vec){
      Selected_positive  = input %>% dplyr::filter(S_coef >=  current_threshold)
      Selected_negative  = input %>% dplyr::filter(S_coef <= -current_threshold) 
       
-     B_load             = rowSums(geno[, Selected_positive$SNP]) %>% as.data.frame() %>% rownames_to_column("id") %>% rename("B" = ".") 
-     D_load             = rowSums(geno[, Selected_negative$SNP]) %>% as.data.frame() %>% rownames_to_column("id") %>% rename("D" = ".")
+    if(nrow(Selected_positive) > 0){
+   
+    B_load = rowSums(geno[, Selected_positive$SNP, drop = FALSE]) } else {
+    B_load = rep(0, nrow(geno)) }
 
-     temp_df            = load_MA %>% 
+    if(nrow(Selected_negative) > 0){
+   
+    D_load = rowSums(geno[, Selected_negative$SNP, drop = FALSE]) } else {
+    D_load = rep(0, nrow(geno)) }
+    
+    B_load = B_load %>% as.data.frame() %>% rownames_to_column("id") %>% rename("B" = ".")
+    D_load = D_load %>% as.data.frame() %>% rownames_to_column("id") %>% rename("D" = ".")
+
+     temp_df            = load_G %>% 
                           left_join(B_load, by = "id") %>% 
                           left_join(D_load, by = "id") %>% 
                           dplyr::mutate("permute" = permute, "permutation" = current_seed, 
-                                        "quantile" = current_quantile, "threshold" = round(current_threshold, 2))
+                                        "quantile" = current_quantile, "threshold" = round(current_threshold, 2)) %>% 
+                          dplyr::mutate(across(c(G, B, D), as.numeric)) 
                           
-     loads_df           = rbind(temp_df, loads_df) }
-  
-     loads_df           = loads_df %>% dplyr::mutate(across(c(G, B, D), as.numeric)) 
-
-     saveRDS(loads_df, paste0(path_output, "fixed_effects/loads_", permute,"_v2.rds")) }}
+     loads_df           = rbind(temp_df, loads_df) }}
+     
+     saveRDS(loads_df, paste0(path_fixed, "loads_", permute,".rds"))  }
   
 #############################################################
 
-Prepare_loads(SSA_output, permute = "unpermuted", seeds = c(0), geno = geno_input, thresholds_vec = thresholds)  
-Prepare_loads(SSA_output, permute = "permuted", seeds = permutations, geno = geno_input, thresholds_vec = thresholds)  
+Prepare_loads(SSA_output, permute = "unpermuted", seeds = c(0),  geno = geno_input, thresholds_vec = thresholds)  
+Prepare_loads(SSA_output, permute = "permuted",   seeds = perms, geno = geno_input, thresholds_vec = thresholds)  
 
 #############################################################
 #D) Function (Variance partition/Random effects)
@@ -90,69 +126,66 @@ Prepare_loads(SSA_output, permute = "permuted", seeds = permutations, geno = gen
 
 Prepare_GRMs      = function(input, geno, permute, seeds, thresholds_vec) { 
    print(permute)
-
-   geno_full        = geno %>% as.data.frame() %>% dplyr::mutate(across(everything(), as.numeric)) %>% as.matrix()
-                           
+              
    for (current_quantile in unique(thresholds_vec$quantile)) {
-   print(current_quantile)
-
+   print(paste("--- threshold", current_quantile))
+   
    current_threshold= thresholds_vec %>% dplyr::filter(quantile == current_quantile) %>% dplyr::pull(threshold)
 
    seed_results     = foreach(current_seed = seeds, .packages = "dplyr", .combine = 'c') %dopar% {
    
    set.seed(current_seed)
    
-   seed_name        = if (permute == "permuted") { paste0("perm_", current_seed)} else { paste0("notperm_", current_seed)}
-
+   seed_name        = if (permute == "permuted") { paste0("perm_", current_seed)} else { paste0("notperm_", current_seed) }
+   
    input_upd        = input
+
    input_upd$S_coef = if (permute == "permuted") { sample(input_upd$S, replace = FALSE) } else { input_upd$S }
 
    Selected         = input_upd %>% dplyr::filter(abs(S_coef) >= current_threshold)
-   sel_idx          = colnames(geno_full) %in% Selected$SNP
+   sel_idx          = colnames(geno) %in% Selected$SNP
 
-   seed_kinships    = list()
-   seed_scaling     = list()
+   seed_kin         = list()
+   scaling          = list()
 
       for (geno_name in c("Sel", "Neu")) {
 
-        G        = if (geno_name == "Sel") { geno_full[, sel_idx, drop = FALSE] } else { geno_full[, !sel_idx, drop = FALSE] }  
+        X_input               = if (geno_name == "Sel") { geno[, sel_idx, drop = FALSE] } else { geno[, !sel_idx, drop = FALSE] }  
 
-        X_center = scale(G, center = TRUE, scale = FALSE)
+        X_center              = scale(X_input, center = TRUE, scale = FALSE)
 
-        p        = colMeans(G) / 2
+        p                     = colMeans(X_input) / 2
         
-        sum_2pq  = sum(2 * p * (1 - p))
-        
-        GRM      = tcrossprod(X_center) / sum_2pq
+        sum_2pq               = sum(2 * p * (1 - p))
 
-        seed_kinships[[geno_name]] = GRM
+        seed_kin[[geno_name]] = tcrossprod(X_center) / sum_2pq
         
         if (permute == "unpermuted") {
         
-        seed_scaling[[length(seed_scaling)+1]]  = data.frame("GRM" = geno_name, "scaling" = sum_2pq, "threshold" = current_threshold,
-                                                             "quantile" = current_quantile, "permute" = permute, "permutation" = seed_name,
-                                                             "no_snps" = ncol(G)) }}
+        scaling[[length(scaling)+1]] = data.frame("GRM" = geno_name, "scaling" = sum_2pq, 
+                                                  "threshold" = current_threshold, "quantile" = current_quantile, 
+                                                  "permute" = permute, "permutation" = seed_name, "no_snps" = ncol(X_input)) }}
       
-       list_result = list()
-       list_result[[seed_name]] <- list(kinships = seed_kinships, scaling = seed_scaling)
+       list_result                   = list()
+       list_result[[seed_name]]      = list(kinships = seed_kin, scaling = scaling)
        list_result }
         
-       saveRDS(seed_results, paste0(path_output, "random_effects/GRMs_", permute, "_", current_quantile, "_v2.rds"))
+       saveRDS(seed_results, paste0(path_random, "GRMs_", permute, "_", current_quantile, ".rds"))
     
        gc() }
 
         if(permute == "unpermuted") {
-        X_center = scale(geno_full, center = TRUE, scale = FALSE)
-        p        = colMeans(geno_full) / 2
+        X_center = scale(geno, center = TRUE, scale = FALSE)
+        p        = colMeans(geno) / 2
         sum_2pq  = sum(2 * p * (1 - p))
         GRM_full = tcrossprod(X_center) / sum_2pq
 
-        saveRDS(GRM_full, paste0(path_output, "random_effects/GRM_baseline_v2.rds")) }}
+        saveRDS(GRM_full, paste0(path_random, "GRM_baseline.rds")) }}
   
 #############################################################
 
-Prepare_GRMs(SSA_output, permute = "unpermuted", seeds = c(0), geno = geno_input, thresholds_vec = thresholds)  
-Prepare_GRMs(SSA_output, permute = "permuted", seeds = permutations, geno = geno_input, thresholds_vec = thresholds)  
+Prepare_GRMs(SSA_output, permute = "unpermuted", seeds = c(0),  geno = geno_input, thresholds_vec = thresholds)  
+Prepare_GRMs(SSA_output, permute = "permuted",   seeds = perms, geno = geno_input, thresholds_vec = thresholds)
 
 #############################################################
 #E) Function prepare kernels for environments
@@ -167,16 +200,16 @@ K                 = diag(1, nrow = length(labels), ncol = length(labels))
 
 rownames(K) <- colnames(K) <- labels
   
-return(K)}
+return(K) }
 
 #Prepare kernels
 kernel_cols       = c("country", "year", "region")
 
-kernels           = lapply(kernel_cols, function(col) create_kernels(data_list, col))
+kernels           = lapply(kernel_cols, function(col) create_kernels(phenotypes_df, col))
 
 names(kernels)    = c("KC", "KY", "KR") 
 
-saveRDS(kernels, paste0(path_pheno, "environment_kernels.rds")) #maybe save at kinships next time
+saveRDS(kernels, paste0(path_random, "ENV_kernels.rds"))
                  
 #############################################################
 stopCluster(cl)
