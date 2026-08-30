@@ -8,38 +8,42 @@ library(tidyr)
 #A) Paths 
 #############################################################
 
-submission         = "submission1"
-
 path               = "/home/tasha/breedfuture/"
-
-path_pheno         = paste0(path, "prepared_data/v2/")
-
-path_geno          = paste0(path, "results/v2/fitness_estimates/")
-
+path_input         = paste0(path, "prepared_data/submission2/")
+path_output        = paste0(path, "output/submission2/")
 path_map           = paste0(path, "raw_data/WW/geno/plink/all_data/")
+path_raw           = "/faststorage/project/breedfuture/raw_data/WW/geno/plink/all_data/"
 
-path_kinships      = paste0(path, "results/v2/kinships/random_effects/")
-
-path_output        = paste0(path, "results/v2/model_output/LDdecay/")
 
 #############################################################
 #B) Input
 #############################################################
+SNPs_exclude       = readLines(paste0(path_raw, "missing_SNPs_final.txt"))
 
-all_samples        = readRDS(paste0(path_pheno, "phenotypes.rds")) %>% pull(id) %>% unique()
-                     
-geno               = readRDS(paste0(path_geno, "geno.rds")) 
-geno_subset        = geno[all_samples, ]
+samples            = readRDS(paste0(path_input, "phenotypes/phenotypes_df.rds")) %>% pull(id) %>% unique()
 
-map                = read.table(paste0(path_map, "ww_updated_final.map"), header=TRUE,col.names=c("CHROM","SNP","POS")) %>% as.data.frame() %>% 
-                     dplyr::filter(SNP %in% colnames(geno))
+SSA_output         = readRDS(paste0(path_input, "SSA/SSA_output_GMMAT_threshold_50_final.rds")) %>% 
+                     dplyr::filter(converged == TRUE,  !SNP %in% SNPs_exclude)
                      
-G                  = readRDS(paste0(path_kinships, "GRM_baseline_v2.rds"))[all_samples, all_samples]
-                     
+geno_input         = readRDS(paste0(path_input, "genotypes/geno_with_IDs_validation.rds"))[samples, SSA_output$SNP] %>% as.matrix()
+
+map                = read.table(paste0(path_map, "ww_updated_final.map"), header= F,col.names=c("CHROM","SNP", "DIST", "POS")) %>% as.data.frame() %>% 
+                     dplyr::filter(SNP %in% colnames(geno_input))
+                                
 chromosomes        = unique(map$CHROM) %>% na.omit() %>% as.vector()
-                                            
+
+#############################################################
+#C) Create GRM
+#############################################################
+ 
+X_center           = scale(geno_input, center = TRUE, scale = FALSE)
+p                  = colMeans(geno_input) / 2
+sum_2pq            = sum(2 * p * (1 - p))
+GRM_G              = tcrossprod(X_center) / sum_2pq
+GRM_G_upd          = as.matrix(Matrix::nearPD(GRM_G)$mat)
+                                          
 #############################################################        
-#C) Functions
+#D) Functions
 #############################################################
 
 invSqrt            = function(mat) {
@@ -51,26 +55,25 @@ L                  = ED$vectors %*% diag(1/sqrt(ED$values)) %*% t(ED$vectors)
 return(L) }              
 
 #############################################################        
-#D) Prepare matrices
+#E) Prepare matrices
 #############################################################
 
-Q                  = prcomp(geno_subset, center = T, scale = F)$x[,1:3]
+Q                  = prcomp(geno_input, center = T, scale = F)$x[,1:3]
 Q                  = cbind(Intercept = 1, Q)
 
-G_upd              = as.matrix(Matrix::nearPD(G)$mat)
 genotypes          = rownames(Q)
 n                  = length(genotypes)
-G_upd              = G_upd[genotypes, genotypes]
-diag(G_upd)        = diag(G_upd) + 1e-5
+GRM_G_upd          = GRM_G_upd[genotypes, genotypes]
+diag(GRM_G_upd)    = diag(GRM_G_upd) + 1e-5
 
 # Projection matrices
 P                  = list()
 P[["Int"]]         = diag(n) - matrix(1, nrow=n, ncol=n)/n
 P[["Q"]]           = diag(n) - Q %*% solve(crossprod(Q)) %*% t(Q)
 
-Ginv               = solve(G_upd)
+Ginv               = solve(GRM_G_upd)
 H                  = Q %*% solve(t(Q) %*% Ginv %*% Q) %*% t(Q) %*% Ginv
-P[["Q+K"]]         = invSqrt(G_upd) %*% (diag(n) - H)
+P[["Q+K"]]         = invSqrt(GRM_G_upd) %*% (diag(n) - H)
 
 max_dist           = 10000000
 
@@ -85,7 +88,7 @@ print(chrom)
 
 current_SNPs        = map %>% dplyr::filter(CHROM == chrom) %>% pull(SNP)
 
-X_raw               = geno[all_samples, current_SNPs] %>% as.matrix() 
+X_raw               = geno_input[, current_SNPs] %>% as.matrix() 
 
 temp_results        = foreach(i = current_SNPs, .combine = 'rbind', .packages = "SNPRelate") %dopar% {
     
@@ -117,6 +120,6 @@ for (adj in names(temp_split)) {
 
 output[[adj]]       = bind_rows(output[[adj]], temp_split[[adj]]) } }
 
-saveRDS(output, paste0(path_output, "LDdecay_",submission,".rds"))
+saveRDS(output, paste0(path_output, "LDdecay.rds"))
 
 #############################################################
