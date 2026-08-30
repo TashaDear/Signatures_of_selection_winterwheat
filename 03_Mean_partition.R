@@ -1,37 +1,35 @@
 #############################################################
 library(dplyr)
 library(foreach)
+library(MM4LMM)
 library(tibble)
 library(tidyr)
-library(MM4LMM)
 #############################################################
 #A) Paths
 ############################################################# 
 
-submission      = "submission1"
-
 path            = "/home/tasha/breedfuture/"
-path_input      = paste0(path, "prepared_data/v2/")
-path_output     = paste0(path, "results/v2/model_output/mean_partition/")
-path_kinships   = paste0(path, "results/v2/kinships/")
+path_input      = paste0(path, "prepared_data/submission2/")
+path_output     = paste0(path, "output/submission2/")
 
 #############################################################
 #B) Inputs
 ############################################################# 
 
+cores           = 30
+
 quantiles       = c(paste0(seq(30, 90, by = 20), "%"), "95%", "99%")
 
-GRM_G           = readRDS(paste0(path_kinships, "random_effects/GRM_baseline_v2.rds"))
+GRM_G           = readRDS(paste0(path_input, "kinships/GRM_baseline.rds"))
 GRM_G_upd       = as.matrix(Matrix::nearPD(GRM_G)$mat)
 
-E_kernels       = readRDS(paste0(path_input, "environment_kernels.rds"))
+E_kernels       = readRDS(paste0(path_input, "kinships/ENV_kernels.rds"))
 
-data_list       = readRDS(paste0(path_input, "phenotypes.rds")) %>% 
-                  dplyr::filter(analysis == "GP") %>% 
+data_list       = readRDS(paste0(path_input, "phenotypes/phenotypes_df.rds")) %>% dplyr::filter(analysis == "GP") %>% 
                   dplyr::mutate_at(vars("id", "year", "region", "country"), as.character) %>% split(.$trait)
 
-loads_unpermuted= readRDS(paste0(path_kinships, "fixed_effects/loads_unpermuted_v2.rds"))
-loads_permuted  = readRDS(paste0(path_kinships, "fixed_effects/loads_permuted_v2.rds"))
+loads_unpermuted= readRDS(paste0(path_input, "loads/loads_unpermuted.rds"))
+loads_permuted  = readRDS(paste0(path_input, "loads/loads_permuted.rds"))
 
 #############################################################
 #C) Mean partition (unpermuted)
@@ -111,7 +109,7 @@ mean_partition  = function(analysis, loads) {
 
    output         = rbind(output, temp_output) } }, error = function(e) { cat("Error: ", e$message, "\n") }) }} 
   
-   saveRDS(output, paste0(path_output,"mean_partition_", analysis, "_unpermuted.rds")) }
+   saveRDS(output, paste0(path_output, "mean_partition_", analysis, "_unpermuted.rds")) }
    
 mean_partition(analysis = "marginal", loads = loads_unpermuted) 
 mean_partition(analysis = "conditional", loads = loads_unpermuted) 
@@ -201,7 +199,7 @@ mean_partition_perm = function(analysis, loads) {
 
    output        = rbind(output, temp_output) }} }, error = function(e) { cat("Error:", e$message, "\n") }) }} 
   
-   saveRDS(output, paste0(path_output,"mean_partition_", analysis, "_permuted.rds")) } 
+   saveRDS(output, paste0(path_output, "mean_partition_", analysis, "_permuted.rds")) } 
 
 mean_partition_perm(analysis = "marginal", loads = loads_permuted) 
 mean_partition_perm(analysis = "conditional", loads = loads_permuted)
