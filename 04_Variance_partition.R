@@ -236,7 +236,7 @@ for(current_trait in names(data_list)) {
                                 country_year   = paste(.$country, .$year, sep = ":"),
                                 country_region = paste(.$country, .$region, sep = ":")) 
 
-   GRM_G_ext    = GRM_G_upd[as.character(data_subset$id), as.character(data_subset$id)]
+   GRM_G_ext    = GRM_G[as.character(data_subset$id), as.character(data_subset$id)]
   
    GxKC         = kronecker(GRM_G, E_kernels[["KC"]], make.dimnames = T)[data_subset$id_country, data_subset$id_country]
    CxY          = kronecker(E_kernels[["KC"]], E_kernels[["KY"]], make.dimnames = T)[data_subset$country_year, data_subset$country_year]
