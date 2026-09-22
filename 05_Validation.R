@@ -21,6 +21,7 @@ path_output       = paste0(path, "output/submission2/")
 quantiles       = c(paste0(seq(30, 90, by = 20), "%"), "95%", "99%")
 
 GRM_G           = readRDS(paste0(path_input, "kinships/GRM_baseline.rds"))
+GRM_G           = as.matrix(Matrix::nearPD(GRM_G)$mat)
 
 E_kernels       = readRDS(paste0(path_input, "kinships/ENV_kernels.rds"))
 
