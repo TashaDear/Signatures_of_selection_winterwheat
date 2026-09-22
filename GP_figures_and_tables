@@ -98,8 +98,6 @@ variance           = rbind(variance_SK, variance_MK)
 reliability_df     = readRDS(paste0(path_models, "SK_reliability_unpermuted.rds"))
 
 #Validation       
-validation_qgg     = readRDS(paste0(path_models, "validation_genetic_cluster_unpermuted.rds")) #qgg
-
 validation_MM4LMM  = readRDS(paste0(path_models, "validation_genetic_cluster_unpermuted_MM4LMM.rds"))
 
 #############################################################
