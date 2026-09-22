@@ -25,7 +25,6 @@ quantiles       = c(paste0(seq(30, 90, by = 20), "%"), "95%", "99%")
 X_input         = as.formula('effect ~ 1 + G + country + G:country')
 
 GRM_G           = readRDS(paste0(path_input, "kinships/GRM_baseline.rds"))
-GRM_G_upd       = as.matrix(Matrix::nearPD(GRM_G)$mat)
 
 E_kernels       = readRDS(paste0(path_input, "kinships/ENV_kernels.rds"))
 
@@ -55,7 +54,7 @@ loads           = readRDS(paste0(path_input, "loads/loads_unpermuted.rds")) %>% 
    KR           = E_kernels[["KR"]][data_subset$region, data_subset$region]
    KY           = E_kernels[["KY"]][data_subset$year, data_subset$year]   
    
-   GRM_G_ext    = GRM_G_upd[data_subset$id, data_subset$id]
+   GRM_G_ext    = GRM_G[data_subset$id, data_subset$id]
    
    V_M1_list    = list("G" = GRM_G_ext, "GxC" = GRM_G_ext * KC, "CxY" = KC * KY)
 
