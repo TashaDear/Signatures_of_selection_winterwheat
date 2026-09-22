@@ -286,23 +286,22 @@ LLR_test           = likelihoods_MK %>%
                      dplyr::mutate(signif = factor(signif, levels = c("> 0.05", "<= 0.05"))) %>%
                      rename_traits()
                      
-chi_thresholds     = data.frame(df = c(1, 1, 2), alpha = 0.05, 
-                                critical_chi = qchisq( p = 1 - 0.05, df = c(1, 1, 2)), comparison = c("M1-M2", "M2-M3", "M1-M3")) %>%
-                     dplyr::mutate(critical_chi = round(critical_chi, 2))
+chi_thresholds     = data.frame(comparison = unique(LLR_test$comparison), threshold = c(qchisq(0.95, 1), qchisq(0.95, 1), qchisq(0.95, 2)))
                                    
 LLR_plot           = ggplot(LLR_test,aes(x = factor(quantile), y = LLR, color = comparison, group = comparison)) +
                      geom_line(linewidth = 0.8) +
                      geom_point(aes(shape = signif), size = 2, stroke = 1.2) +
                      scale_shape_manual(name = "Empirical p-value", values = c("<= 0.05" = 16, "> 0.05" = 1)) +
                      scale_color_viridis_d() + guides(color = "none") +
-                     geom_hline(yintercept = qchisq(0.95, df = 1), linetype = "dashed", color = "red", linewidth = 1) + 
+                     geom_hline(data = chi_thresholds, aes(yintercept = threshold), 
+                                linetype = "dashed", color = "red", linewidth = 1, inherit.aes = FALSE) +
                      facet_grid(comparison ~ trait) +
                      theme_bw() +
                      labs(x = "Minimum score percentile", y = "LLR-statistics") +
                      theme(legend.position = "bottom",
                            strip.text  = element_text(size = 12),
-                           axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))                      
-                                                                      
+                           axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) 
+                                                                  
 LLR_test_final     = LLR_test %>%
                      dplyr::mutate(across(where(is.numeric), ~ round(.x, 9))) %>% dplyr::rename(p_analytical = pval) %>%
                      dplyr::select(-c("signif"))
@@ -391,34 +390,6 @@ Variance_MK_plot   = ggplot(
 #I) Validation
 #############################################################
 
-#QGG
-validation_upd_qgg  = validation_qgg %>% 
-                      group_by(trait, quantile, random_model, fixed_model, permuted, permutation) %>% 
-                      summarise(PA = mean(Corr, na.rm = TRUE), SE = sd(Corr, na.rm = TRUE) / sqrt(n()), .groups = "drop") %>%
-                      rename_traits()
-                                                   
-GP_baseline_qgg     = validation_upd_qgg %>%
-                      dplyr::filter(permuted == "no", random_model == "M1", fixed_model == "X1") %>%
-                      dplyr::select(c("trait", "PA", "SE")) %>% dplyr::rename(PA_baseline = PA) %>% distinct(trait, PA_baseline, SE)
-                      
-GP_extended_qgg     = validation_upd_qgg %>% 
-                      left_join(GP_baseline_qgg %>% dplyr::select(trait, PA_baseline), by = "trait") %>%
-                      dplyr::mutate(improv = PA - PA_baseline) %>%
-                      dplyr::filter(permuted == "no", !(random_model == "M1" & fixed_model == "X1")) %>%
-                      dplyr::select(-c("permuted", "permutation", "SE", "PA", "PA_baseline")) %>%
-                      dplyr::mutate(across(where(is.numeric), ~ round(.x, 7))) %>%
-                      dplyr::filter(!is.na(improv)) %>% 
-                      pivot_wider(names_from  = quantile, values_from = improv) %>%
-                      mutate(model = case_when(random_model == "M1" & fixed_model == "X2" ~ "M1A",
-                                               random_model == "M1" & fixed_model == "X3" ~ "M1B",
-                                               random_model == "M2" & fixed_model == "X1" ~ "M2",
-                                               random_model == "M3" & fixed_model == "X1" ~ "M3", TRUE ~ NA_character_)) %>%
-                      dplyr::filter(!is.na(model)) %>% dplyr::select(-c("random_model", "fixed_model")) %>%
-                      pivot_longer(cols = -c(trait, model), names_to = "quantile",values_to = "improv") 
-                      
-#############################################################
-
-#MM4LMM
 validation_upd_MM4LMM = validation_MM4LMM %>%
                         group_by(trait, quantile, random_model, fixed_model, fold) %>%
                         summarise(Corr = cor(predicted, observed, use = "complete.obs"), .groups = "drop") %>%
@@ -444,9 +415,7 @@ GP_extended_MM4LMM    = validation_upd_MM4LMM %>%
                         dplyr::select(-c("random_model", "fixed_model")) %>%
                         pivot_longer(cols = -c(trait, model), names_to = "quantile",values_to = "improv") 
 
-#############################################################
-
-GP_baseline         = GP_baseline_qgg
+GP_baseline         = GP_baseline_MM4LMM
                       
 GP_baseline_plot    = ggplot(GP_baseline, aes(x = trait, y = PA_baseline)) +
                       geom_col(fill = "grey60", width = 0.7) +
@@ -458,7 +427,7 @@ GP_baseline_plot    = ggplot(GP_baseline, aes(x = trait, y = PA_baseline)) +
                             axis.title  = element_text(size = 10)) +
                       ylim(0, 1)
 
-GP_extended         = GP_extended_qgg
+GP_extended         = GP_extended_MM4LMM
 
 GP_extended_plot    = ggplot(GP_extended, aes(x = quantile, y = improv, colour = model, group = model)) +
                       geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
@@ -474,60 +443,7 @@ GP_extended_plot    = ggplot(GP_extended, aes(x = quantile, y = improv, colour =
                             axis.title      = element_text(size = 10)) +ylim(-0.01, 0.01)
                                          
 #############################################################
-#J) Phenotypic analyses (spatial models)
-#############################################################
-
-#Function
-extract_spatial_models = function(traits, countries, years, regions, analysis) {
-  
-model_info  = purrr::map_dfr(traits, function(trait) { purrr::map_dfr(countries, function(country) { region_info = regions[[trait]][[country]]
-         
-         
-         if (is.list(region_info)) {
-            
-            purrr::map_dfr(years, function(year) {
-                
-expand.grid(trait = trait, country = country, year = year, region = region_info[[as.character(year)]], analysis = analysis,stringsAsFactors = FALSE)})
-            
-          } else {
-            
-expand.grid(trait = trait, country = country, year = years, region = region_info, analysis = analysis, stringsAsFactors = FALSE)}})}) %>%
-            dplyr::mutate(file = paste0(spatial_models,"BLUES_", trait, "_", country, year, "_R", region, ".rds"),
-      model = purrr::map(file, readRDS),
-      spatial_function = purrr::map_chr(model, ~ .x$formula$random %>% as.character() %>% paste(collapse = "") %>% sub("^~", "", .))) %>%
-      dplyr::select(trait, country, year, region, analysis, spatial_function) %>% rename_traits()
-  
-  return(model_info) }
-
-#############################################################
-
-traits            = c("Heading date", "Plantheight", "Protein", "Yield")
-countries         = c("DE", "DK")
-years             = c(2021, 2022, 2023)
-analysis          = "GP"
-regions           = list("Heading date" = list(DE = 4, DK = 3), 
-                         "Plantheight" = list(DE = 4, DK = 3), 
-                         "Protein" = list( DE = 4, DK = c(2, 3)),
-                         "Yield" = list(DE = 4, DK = c(2, 3)))
-
-#############################################################
-
-traits            = c("Protein", "Yield")
-countries         = c("DK")
-years             = c(2015:2020)
-analysis          = "GWAS"
-regions           = list("Protein" = list(DK = list(`2015` = c(2, 3), `2016` = c(2, 3), `2017` = c(2, 3), 
-                                                    `2018` = 3, `2019` = c(2, 3),`2020` = c(2, 3))),
-                         "Yield"   = list(DK = list(`2015` = c(2, 3), `2016` = c(2, 3), `2017` = c(2, 3), 
-                                                    `2018` = 3, `2019` = c(2, 3), `2020` = c(2, 3))))
-
-
-spatial_table_GP     = extract_spatial_models(traits, countries, years, regions, analysis)
-spatial_table_GWAS   = extract_spatial_models(traits, countries, years, regions, analysis)
-spatial_models_table = list("GP" = spatial_table_GP, "GWAS" = spatial_table_GWAS)
-
-#############################################################
-#K) Figures
+#J) Figures
 #############################################################
 
 #Main
@@ -548,22 +464,19 @@ S3                 = Variance_MK_plot
 ggsave(paste0(path_figures, "S3.png"), plot = S3, width = 6, height = 7, dpi = 500)
 
 #############################################################
-#L) Tables (In main or supplementary)
+#K) Tables (In manuscript)
 #############################################################
 
 write_xlsx(mean_part_table, paste0(path_tables,"TS2_mean_partition_Wald_test.xlsx")) 
 write_xlsx(LLR_test_final, paste0(path_tables,"TS3_variance_partition_LLR_test.xlsx"))
 
 #############################################################
-#M) Tables (Not in main or supplementary)
+#L) Tables (Not in manuscript)
 #############################################################
 
-write_xlsx(spatial_table_GP, paste0(path_tables,"not_manuscript/T0G_GP_spatial_models_table.xlsx"))
-write_xlsx(spatial_table_GWAS, paste0(path_tables,"not_manuscript/T0H_GWAS_spatial_models_table.xlsx"))
-
-write_xlsx(heritability_df, paste0(path_tables,"not_manuscript/T0I_variance_partition_reliability.xlsx"))
-write_xlsx(chi_thresholds, paste0(path_tables,"not_manuscript/T0J_variance_partition_chitest_thresholds.xlsx"))
-write_xlsx(GP_baseline, paste0(path_tables,"not_manuscript/T0K_validation_baseline.xlsx"))
+write_xlsx(heritability_df, paste0(path_tables,"not_manuscript/T0_variance_partition_reliability.xlsx"))
+write_xlsx(chi_thresholds, paste0(path_tables,"not_manuscript/T0_variance_partition_chitest_thresholds.xlsx"))
+write_xlsx(GP_baseline, paste0(path_tables,"not_manuscript/T0_validation_baseline.xlsx"))
 
 #############################################################
 #############################################################
