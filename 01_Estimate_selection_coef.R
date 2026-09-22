@@ -28,8 +28,7 @@ SSA_input          = readRDS(paste0(path_out, "SSA/SSA_input_final.rds"))
 prepare_GRM       = function(input) {
 
    X              = input %>% dplyr::select(-c("crossing_year", "PC1", "PC2", "PC3")) %>% column_to_rownames("id") %>% as.matrix()  
-   X[X == 1]      = 2
-   X[X == 0.5]    = 1    
+   X              = X*2 
    X_center       = scale(X, center = TRUE, scale = FALSE)
    p              = colMeans(X) / 2
    sum_2pq        = sum(2 * p * (1 - p))
